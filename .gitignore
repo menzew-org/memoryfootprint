@@ -1,0 +1,11 @@
+/build/
+
+/.memftprt_*.lock
+/*.tmp.*
+/proccess_maps_*.txt
+/process_ps_*.txt
+/process_top_*.txt
+/process_tree_memory_*.tsv
+/capture_metadata_*.tsv
+/jvm_nmt_*.txt
+/jvm_nmt_*.tsv
