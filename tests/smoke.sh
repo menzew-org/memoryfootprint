@@ -36,6 +36,7 @@ grep -q "Try 'memftprt --help'" "$tmp_dir/noargs.out"
 "$binary" --help >"$tmp_dir/help.out"
 grep -q "consistent process-tree memory capture" "$tmp_dir/help.out"
 grep -q -- "--output-dir DIR" "$tmp_dir/help.out"
+grep -q -- "--format FORMAT" "$tmp_dir/help.out"
 "$binary" --version >"$tmp_dir/version.out"
 grep -Eq '^memftprt [0-9]+\.[0-9]+-reconstructed$' "$tmp_dir/version.out"
 
@@ -95,12 +96,23 @@ fi
 terminate_tree process_tree_memory_*.tsv
 
 cd "$tmp_dir/ux"
-"$binary" --quiet --verbose --output-dir artifacts --delay 1 -- /bin/sleep 3 \
+"$binary" --quiet --verbose --format all --output-dir artifacts --delay 1 -- /bin/sleep 3 \
     >quiet.out 2>&1
 test ! -s quiet.out
 test -s artifacts/process_tree_memory_*.tsv
+test -s artifacts/memory_report_*.json
+test -s artifacts/memory_report_*.html
 test -s artifacts/capture_metadata_*.tsv
 test ! -e process_tree_memory_*.tsv
+python3 -m json.tool artifacts/memory_report_*.json >/dev/null
+grep -q '"schema_version": 1' artifacts/memory_report_*.json
+grep -q '"processes":' artifacts/memory_report_*.json
+grep -qi '<!doctype html>' artifacts/memory_report_*.html
+grep -q 'Process-tree totals' artifacts/memory_report_*.html
+grep -q 'How to read this' artifacts/memory_report_*.html
+for artifact in artifacts/memory_report_*.json artifacts/memory_report_*.html; do
+    test "$(stat -c %a "$artifact")" = 600
+done
 terminate_tree artifacts/process_tree_memory_*.tsv
 
 cd "$tmp_dir/symlink"

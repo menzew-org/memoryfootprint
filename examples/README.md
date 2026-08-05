@@ -13,6 +13,15 @@ memftprt --output-dir captures --stable-window 5 --timeout 120 -- \
 The server remains running after capture. The result directory is created when
 needed.
 
+To produce every supported report in one capture:
+
+```sh
+memftprt --format all --output-dir captures -- ./server --port 8080
+```
+
+Open `memory_report_PID.html` for an annotated human view, consume
+`memory_report_PID.json` in automation, or use the TSV with shell tools.
+
 ## Capture a continuously busy worker
 
 ```sh
@@ -74,6 +83,7 @@ most common policy:
 
 ```sh
 MEMFTPRT_OUTPUT_DIR=./captures \
+MEMFTPRT_FORMAT=all \
 MEMFTPRT_STABLE_WINDOW=5 \
 MEMFTPRT_TIMEOUT=120 \
   ./examples/capture-command.sh ./server --port 8080

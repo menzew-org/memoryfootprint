@@ -3,7 +3,7 @@
 `memftprt` captures a consistent, process-tree-wide memory footprint on Linux.
 It waits for an application to settle, optionally collects HotSpot JVM Native
 Memory Tracking data, freezes the complete application tree, and writes both a
-readable summary and machine-readable artifacts.
+readable summary and TSV, JSON, or self-contained HTML reports.
 
 The maintained code is a C++17 reconstruction of the useful behavior of
 `memftprt` 1.39, extended with modern Linux process-tree accounting,
@@ -60,11 +60,14 @@ make install PREFIX="$HOME/.local"
 ### 1. Capture a command
 
 ```sh
-./build/memftprt --output-dir captures -- ./server --port 8080
+./build/memftprt --format all --output-dir captures -- ./server --port 8080
 ```
 
 The command starts immediately. `memftprt` waits until the whole process tree
 is stable for three seconds, captures it, and leaves the application running.
+`--format all` writes TSV for shell analysis, JSON for automation, and an HTML
+report that opens directly in a browser. TSV remains the default for backward
+compatibility.
 
 ### 2. Attach to a running process
 
@@ -81,6 +84,7 @@ and follows surviving workers when a wrapper exits.
 ```sh
 column -s $'\t' -t captures/process_tree_memory_*.tsv | less -S
 ./examples/read-total.sh captures/process_tree_memory_*.tsv
+xdg-open captures/memory_report_*.html
 ```
 
 Start with the `TOTAL` row's PSS and USS. Use per-process rows to find which
@@ -109,6 +113,7 @@ More copy-and-paste recipes are in [examples/](examples/README.md).
 | `-m, --timeout SEC` | Maximum quiescence wait; default `300` seconds |
 | `-t, --delay SEC` | Use a fixed delay instead of quiescence detection |
 | `-o, --output-dir DIR` | Write all capture artifacts to `DIR` |
+| `-f, --format tsv\|json\|html\|all` | Select the primary report format; default `tsv` |
 | `--freeze auto|cgroup|signals` | Select or require a freeze backend |
 | `--cgroup PATH` | Launch into an empty delegated cgroup v2 |
 | `--enable-jvm-nmt` | Enable NMT for a JVM launched by the tool |
@@ -146,6 +151,8 @@ cgroup has thawed before reporting success.
 | Artifact | Contents |
 | --- | --- |
 | `process_tree_memory_PID.tsv` | Per-process memory and aggregate `TOTAL` row |
+| `memory_report_PID.json` | Versioned machine-readable capture, process rows, and totals |
+| `memory_report_PID.html` | Self-contained browser report with interpretation guidance |
 | `capture_metadata_PID.tsv` | Freeze backend, cgroup, launcher, and runtime status |
 | `proccess_maps_PID.txt` | `/proc/PID/maps`; legacy misspelling retained |
 | `process_ps_PID.txt` | Root-process `ps` snapshot |
@@ -156,6 +163,8 @@ cgroup has thawed before reporting success.
 Artifacts are mode `0600`. They stay on descriptor-backed randomized temporary
 files through write and `fsync`, then are atomically renamed. A per-target lock
 prevents concurrent collectors from writing the same PID-based result set.
+Capture metadata and diagnostic snapshots are written regardless of primary
+report format because they explain how the measurement was obtained.
 
 ## Exit behavior
 
@@ -193,6 +202,7 @@ environment denies ptrace, the suite exits `77`; use
 
 - [Understanding the output](docs/UNDERSTANDING_OUTPUT.md)
 - [Runtime adapter design](docs/RUNTIME_ADAPTERS.md)
+- [Code architecture](docs/ARCHITECTURE.md)
 - [Examples](examples/README.md)
 - [Contributing](CONTRIBUTING.md)
 

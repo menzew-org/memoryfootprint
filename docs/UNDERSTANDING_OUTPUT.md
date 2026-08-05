@@ -8,7 +8,7 @@ measurement error.
 
 For the memory physically attributable to the complete application, begin with:
 
-1. `TOTAL` PSS in `process_tree_memory_PID.tsv`;
+1. total PSS in the selected TSV, JSON, or HTML report;
 2. `TOTAL` USS to see the private, non-shared portion; and
 3. per-process PSS rows to locate the worker responsible.
 
@@ -25,8 +25,10 @@ The console has two families of metrics:
   `/proc/PID/status`, `stat`, `statm`, `ps`, and page-based counters.
 
 Those root metrics are useful for comparison with older runs, but they are not
-the complete footprint of an application with workers. The process-tree TSV is
-the authoritative machine-readable result.
+the complete footprint of an application with workers. All primary formats are
+rendered from the same frozen in-memory report. TSV is the compatibility
+format, JSON is the structured automation format, and HTML is the annotated
+human-readable format.
 
 Some intentionally retained details can look unusual:
 
@@ -87,6 +89,28 @@ command cell states how many processes contributed. A simple view is:
 ```sh
 ./examples/read-total.sh captures/process_tree_memory_*.tsv
 ```
+
+## Reading JSON and HTML reports
+
+`memory_report_PID.json` is a versioned document. Its top-level fields are:
+
+- `schema_version`: currently `1`;
+- `unit`: `KB` for every memory value;
+- `capture`: root/launcher identity, timestamp, freeze backend, and cgroup;
+- `runtime_status`: per-PID runtime probe outcomes;
+- `processes`: one normalized memory object per captured process; and
+- `total`: the aggregate of the frozen process tree.
+
+Unavailable measurements are JSON `null`, while a measured zero remains `0`.
+This distinction matters when comparing hosts or kernels. Consumers should
+reject unsupported future schema versions rather than silently guessing their
+meaning.
+
+`memory_report_PID.html` contains the same core measurements, totals cards, a
+per-process table, runtime statuses, and a short explanation of VSize, RSS,
+PSS, USS, and runtime overlap. It is self-contained: no JavaScript, network
+requests, fonts, or other external assets are required. Target command names
+and metadata are HTML-escaped before rendering.
 
 ## Why `ps`, `top`, and the tree TSV differ
 

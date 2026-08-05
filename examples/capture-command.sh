@@ -10,9 +10,11 @@ binary="${MEMFTPRT_BIN:-memftprt}"
 output_dir="${MEMFTPRT_OUTPUT_DIR:-./captures}"
 stable_window="${MEMFTPRT_STABLE_WINDOW:-3}"
 timeout="${MEMFTPRT_TIMEOUT:-300}"
+report_format="${MEMFTPRT_FORMAT:-tsv}"
 
 exec "$binary" \
     --output-dir "$output_dir" \
+    --format "$report_format" \
     --stable-window "$stable_window" \
     --timeout "$timeout" \
     -- "$@"

@@ -1,9 +1,11 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Buildable reconstruction of memftprt 1.39.
+ * Linux capture orchestrator for memftprt.
  *
- * This is maintained reconstructed source, not original source text.
+ * Owns target lifecycle, quiescence detection, consistent process-tree
+ * freezing, Linux snapshot commands, and runtime-probe coordination. Generic
+ * CLI, artifact storage, and report rendering live in separate modules.
  */
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -34,6 +37,13 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "../artifact_store.h"
+#include "../capture.h"
+#include "../cli.h"
+#include "../memory_report.h"
+#include "../runtime/hotspot_nmt.h"
+#include "proc_memory.h"
 
 using ulong_t = unsigned long;
 
@@ -83,6 +93,7 @@ static_assert(sizeof(fp_metric) == 32, "DWARF says fp_metric is 32 bytes");
 static_assert(sizeof(fp_prochandle) == 16, "DWARF says fp_prochandle is 16 bytes");
 static_assert(sizeof(proc_stats) == 184, "DWARF says proc_stats is 184 bytes");
 
+namespace memftprt {
 namespace {
 
 constexpr unsigned short FP_CREATED = 0x01;
@@ -90,7 +101,6 @@ constexpr unsigned short FP_GRABBED = 0x02;
 constexpr unsigned short FP_STOPPING = 0x04;
 constexpr unsigned short FP_STOPPED = 0x40;
 constexpr unsigned short FP_LIVE = FP_CREATED | FP_GRABBED;
-constexpr const char* MEMFTPRT_VERSION = "1.39-reconstructed";
 
 int debug_level = 0;
 const char* program_name = "memftprt";
@@ -116,16 +126,10 @@ bool root_externally_stopped = false;
 bool target_launched = false;
 pid_t original_launcher_pid = -1;
 bool quiet_mode = false;
-std::filesystem::path output_directory = ".";
-std::vector<std::string> committed_artifacts;
+std::unique_ptr<ArtifactStore> artifact_store;
 
-enum class freeze_mode {
-    automatic,
-    cgroup,
-    signals,
-};
-
-freeze_mode requested_freeze_mode = freeze_mode::automatic;
+FreezeMode requested_freeze_mode = FreezeMode::automatic;
+ReportFormat requested_report_format = ReportFormat::tsv;
 bool jcmd_enabled = true;
 bool enable_jvm_nmt = false;
 std::string selected_freeze_backend = "none";
@@ -142,7 +146,6 @@ struct runtime_capture_metadata {
     bool forced_gc = false;
 };
 std::map<pid_t, runtime_capture_metadata> jvm_capture_status;
-int output_lock_fd = -1;
 
 void release_process(fp_prochandle* fp_proc);
 int kill_process(fp_prochandle* fp_proc);
@@ -251,216 +254,42 @@ void announce_wait(pid_t pid, const char* action) {
 
 void announce_completion(pid_t pid) {
     user_message("capture complete for process %d using %s freeze; %zu artifacts in %s\n", pid,
-                 selected_freeze_backend.c_str(), committed_artifacts.size(),
-                 output_directory.c_str());
+                 selected_freeze_backend.c_str(), artifact_store->committed_count(),
+                 artifact_store->directory().c_str());
 }
 
 std::string output_path(const std::string& filename) {
-    return (output_directory / filename).string();
+    return artifact_store->path(filename);
 }
 
 void acquire_output_lock(pid_t root_pid) {
-    const std::string lock_name =
-        output_path(".memftprt_" + std::to_string(root_pid) + ".lock");
-    int flags = O_RDWR | O_CREAT | O_CLOEXEC;
-#ifdef O_NOFOLLOW
-    flags |= O_NOFOLLOW;
-#endif
-    output_lock_fd = open(lock_name.c_str(), flags, 0600);
-    if (output_lock_fd < 0) {
-        abend("could not create output lock %s: %s\n", lock_name.c_str(), std::strerror(errno));
-    }
-    struct stat lock_status {};
-    int lock_error = 0;
-    if (fstat(output_lock_fd, &lock_status) < 0) {
-        lock_error = errno;
-    } else if (!S_ISREG(lock_status.st_mode)) {
-        lock_error = EINVAL;
-    } else if (fchmod(output_lock_fd, 0600) < 0) {
-        lock_error = errno;
-    }
-    if (lock_error != 0) {
-        close(output_lock_fd);
-        output_lock_fd = -1;
-        abend("output lock %s is not a secure regular file: %s\n", lock_name.c_str(),
-              std::strerror(lock_error));
-    }
-    if (flock(output_lock_fd, LOCK_EX | LOCK_NB) < 0) {
-        const int saved_errno = errno;
-        close(output_lock_fd);
-        output_lock_fd = -1;
-        abend("another collector is already writing artifacts for process %d: %s\n", root_pid,
-              std::strerror(saved_errno));
-    }
+    std::string reason;
+    if (!artifact_store->acquire_lock(root_pid, &reason)) abend("%s\n", reason.c_str());
 }
 
 void release_output_lock() {
-    if (output_lock_fd >= 0) {
-        close(output_lock_fd);
-        output_lock_fd = -1;
-    }
+    if (artifact_store != nullptr) artifact_store->release_lock();
 }
 
-struct secure_temp_file {
-    int fd = -1;
-    std::string path;
-};
+using secure_temp_file = ArtifactStore::TempFile;
 
 void discard_secure_temp(secure_temp_file* temporary) {
-    if (temporary->fd >= 0) {
-        close(temporary->fd);
-        temporary->fd = -1;
-    }
-    if (!temporary->path.empty()) {
-        unlink(temporary->path.c_str());
-        temporary->path.clear();
-    }
+    artifact_store->discard_temp(temporary);
 }
 
 bool create_secure_temp(const std::string& output_name, secure_temp_file* temporary,
                         std::string* reason) {
-    std::string pattern = output_name + ".tmp.XXXXXX";
-    std::vector<char> writable_pattern(pattern.begin(), pattern.end());
-    writable_pattern.push_back('\0');
-    const int fd = mkstemp(writable_pattern.data());
-    if (fd < 0) {
-        *reason = "could not securely create a temporary file for " + output_name + ": " +
-                  std::strerror(errno);
-        return false;
-    }
-    temporary->fd = fd;
-    temporary->path = writable_pattern.data();
-    struct stat status {};
-    int secure_error = 0;
-    if (fstat(fd, &status) < 0) {
-        secure_error = errno;
-    } else if (!S_ISREG(status.st_mode)) {
-        secure_error = EINVAL;
-    } else if (fchmod(fd, 0600) < 0) {
-        secure_error = errno;
-    } else if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-        secure_error = errno;
-    }
-    if (secure_error != 0) {
-        discard_secure_temp(temporary);
-        *reason = "could not secure temporary output for " + output_name + ": " +
-                  std::strerror(secure_error);
-        return false;
-    }
-    return true;
-}
-
-bool write_all(int fd, const std::string& contents, std::string* reason) {
-    std::size_t offset = 0;
-    while (offset < contents.size()) {
-        const ssize_t count = write(fd, contents.data() + offset, contents.size() - offset);
-        if (count > 0) {
-            offset += static_cast<std::size_t>(count);
-            continue;
-        }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        const int write_error = count == 0 ? EIO : errno;
-        *reason = "write failed: " + std::string(std::strerror(write_error));
-        return false;
-    }
-    return true;
+    return artifact_store->create_temp(output_name, temporary, reason);
 }
 
 bool commit_secure_temp(secure_temp_file* temporary, const std::string& output_name,
                         std::string* reason) {
-    if (fsync(temporary->fd) < 0) {
-        *reason = "fsync failed for " + temporary->path + ": " + std::strerror(errno);
-        discard_secure_temp(temporary);
-        return false;
-    }
-    if (close(temporary->fd) < 0) {
-        temporary->fd = -1;
-        *reason = "close failed for " + temporary->path + ": " + std::strerror(errno);
-        discard_secure_temp(temporary);
-        return false;
-    }
-    temporary->fd = -1;
-    if (rename(temporary->path.c_str(), output_name.c_str()) < 0) {
-        *reason = "rename " + temporary->path + " to " + output_name + " failed: " +
-                  std::strerror(errno);
-        discard_secure_temp(temporary);
-        return false;
-    }
-    temporary->path.clear();
-    committed_artifacts.push_back(output_name);
-    return true;
+    return artifact_store->commit_temp(temporary, output_name, reason);
 }
 
 bool write_atomic_text(const std::string& output_name, const std::string& contents,
                        std::string* reason) {
-    secure_temp_file temporary;
-    if (!create_secure_temp(output_name, &temporary, reason)) {
-        return false;
-    }
-    if (!write_all(temporary.fd, contents, reason)) {
-        discard_secure_temp(&temporary);
-        return false;
-    }
-    return commit_secure_temp(&temporary, output_name, reason);
-}
-
-void print_help(FILE* stream) {
-    std::fprintf(stream, "memftprt %s - consistent process-tree memory capture\n\n",
-                 MEMFTPRT_VERSION);
-    std::fprintf(stream, "Usage:\n");
-    std::fprintf(stream, "  %s [options] -- command [args...]\n", program_name);
-    std::fprintf(stream, "  %s [options] --pid PID\n\n", program_name);
-    std::fprintf(stream, "Capture timing:\n");
-    std::fprintf(stream, "  -q, --stable-window SEC  required stable window (default: 3)\n");
-    std::fprintf(stream, "  -m, --timeout SEC        maximum quiescence wait (default: 300)\n");
-    std::fprintf(stream, "  -t, --delay SEC          use a fixed delay instead of quiescence\n\n");
-    std::fprintf(stream, "Target and consistency:\n");
-    std::fprintf(stream, "  -p, --pid PID            attach to an existing process\n");
-    std::fprintf(stream, "      --freeze MODE        auto, cgroup, or signals (default: auto)\n");
-    std::fprintf(stream, "      --cgroup PATH        launch in an empty delegated cgroup v2\n\n");
-    std::fprintf(stream, "Runtime capture:\n");
-    std::fprintf(stream, "      --enable-jvm-nmt     enable HotSpot NMT for a launched JVM\n");
-    std::fprintf(stream, "      --no-jcmd            disable automatic JVM NMT collection\n\n");
-    std::fprintf(stream, "Output and diagnostics:\n");
-    std::fprintf(stream, "  -o, --output-dir DIR     write artifacts to DIR (default: current directory)\n");
-    std::fprintf(stream, "      --quiet              emit nothing on successful capture\n");
-    std::fprintf(stream, "  -v, --verbose            show capture decisions; repeat for more detail\n");
-    std::fprintf(stream, "  -h, --help               show this help and exit\n");
-    std::fprintf(stream, "  -V, --version            show version and exit\n\n");
-    std::fprintf(stream, "Examples:\n");
-    std::fprintf(stream, "  %s -o captures -- ./server --port 8080\n", program_name);
-    std::fprintf(stream, "  %s --pid 1234 --stable-window 5\n", program_name);
-    std::fprintf(stream, "  %s --enable-jvm-nmt -- java -jar app.jar\n", program_name);
-}
-
-[[noreturn]] void cli_error(const char* format, ...) {
-    std::fprintf(stderr, "%s: error: ", program_name);
-    va_list args;
-    va_start(args, format);
-    std::vfprintf(stderr, format, args);
-    va_end(args);
-    std::fprintf(stderr, "\nTry '%s --help' for usage.\n", program_name);
-    std::exit(2);
-}
-
-void prepare_output_directory() {
-    std::error_code error;
-    if (!std::filesystem::exists(output_directory, error)) {
-        (void)std::filesystem::create_directories(output_directory, error);
-        if (error) {
-            cli_error("could not create output directory %s: %s",
-                      output_directory.c_str(), error.message().c_str());
-        }
-    }
-    if (error || !std::filesystem::is_directory(output_directory, error)) {
-        cli_error("output path is not a directory: %s", output_directory.c_str());
-    }
-    output_directory = std::filesystem::canonical(output_directory, error);
-    if (error || access(output_directory.c_str(), W_OK | X_OK) < 0) {
-        cli_error("output directory is not writable: %s", output_directory.c_str());
-    }
+    return artifact_store->write_text(output_name, contents, reason);
 }
 
 void termination_handler(int signal_number) {
@@ -1517,7 +1346,7 @@ std::set<pid_t> freeze_process_tree(pid_t root_pid) {
     constexpr int max_tree_stabilization_rounds = 10;
     constexpr auto stop_timeout = std::chrono::seconds(2);
 
-    if (requested_freeze_mode != freeze_mode::signals) {
+    if (requested_freeze_mode != FreezeMode::signals) {
         std::set<pid_t> cgroup_tree;
         std::string reason;
         if (try_freeze_cgroup(root_pid, &cgroup_tree, &reason)) {
@@ -1527,7 +1356,7 @@ std::set<pid_t> freeze_process_tree(pid_t root_pid) {
             abend("cgroup freeze failed and the target remains frozen at %s: %s\n",
                   frozen_cgroup_path.c_str(), reason.c_str());
         }
-        if (requested_freeze_mode == freeze_mode::cgroup) {
+        if (requested_freeze_mode == FreezeMode::cgroup) {
             abend("cgroup freeze requested but unavailable: %s\n", reason.c_str());
         }
         d_printf(1, "freeze backend: cgroup unavailable (%s); using signals\n",
@@ -1610,166 +1439,46 @@ std::set<pid_t> freeze_process_tree(pid_t root_pid) {
     abend("process tree did not stabilize while freezing\n");
 }
 
-struct smaps_metrics {
-    unsigned long size_kb = 0;
-    unsigned long rss_kb = 0;
-    unsigned long pss_kb = 0;
-    unsigned long pss_anon_kb = 0;
-    unsigned long pss_file_kb = 0;
-    unsigned long pss_shmem_kb = 0;
-    unsigned long shared_clean_kb = 0;
-    unsigned long shared_dirty_kb = 0;
-    unsigned long private_clean_kb = 0;
-    unsigned long private_dirty_kb = 0;
-    unsigned long private_hugetlb_kb = 0;
-    unsigned long anonymous_kb = 0;
-    unsigned long swap_kb = 0;
-    unsigned long swap_pss_kb = 0;
-    bool rss_available = false;
-    bool pss_available = false;
-    bool pss_anon_available = false;
-    bool pss_file_available = false;
-    bool pss_shmem_available = false;
-    bool shared_clean_available = false;
-    bool shared_dirty_available = false;
-    bool private_clean_available = false;
-    bool private_dirty_available = false;
-    bool private_hugetlb_available = false;
-    bool swap_available = false;
-    bool swap_pss_available = false;
-};
-
-void add_smaps_field(smaps_metrics* metrics, const std::string& key, unsigned long value) {
-    if (key == "Size") {
-        metrics->size_kb += value;
-    } else if (key == "Rss") {
-        metrics->rss_kb += value;
-        metrics->rss_available = true;
-    } else if (key == "Pss") {
-        metrics->pss_kb += value;
-        metrics->pss_available = true;
-    } else if (key == "Pss_Anon") {
-        metrics->pss_anon_kb += value;
-        metrics->pss_anon_available = true;
-    } else if (key == "Pss_File") {
-        metrics->pss_file_kb += value;
-        metrics->pss_file_available = true;
-    } else if (key == "Pss_Shmem") {
-        metrics->pss_shmem_kb += value;
-        metrics->pss_shmem_available = true;
-    } else if (key == "Shared_Clean") {
-        metrics->shared_clean_kb += value;
-        metrics->shared_clean_available = true;
-    } else if (key == "Shared_Dirty") {
-        metrics->shared_dirty_kb += value;
-        metrics->shared_dirty_available = true;
-    } else if (key == "Private_Clean") {
-        metrics->private_clean_kb += value;
-        metrics->private_clean_available = true;
-    } else if (key == "Private_Dirty") {
-        metrics->private_dirty_kb += value;
-        metrics->private_dirty_available = true;
-    } else if (key == "Private_Hugetlb") {
-        metrics->private_hugetlb_kb += value;
-        metrics->private_hugetlb_available = true;
-    } else if (key == "Anonymous") {
-        metrics->anonymous_kb += value;
-    } else if (key == "Swap") {
-        metrics->swap_kb += value;
-        metrics->swap_available = true;
-    } else if (key == "SwapPss") {
-        metrics->swap_pss_kb += value;
-        metrics->swap_pss_available = true;
-    }
-}
-
-bool uss_available(const smaps_metrics& metrics) {
-    return metrics.private_clean_available && metrics.private_dirty_available &&
-           metrics.private_hugetlb_available;
-}
-
-void merge_smaps_metrics(smaps_metrics* total, const smaps_metrics& memory, bool first) {
-    total->size_kb += memory.size_kb;
-    total->rss_kb += memory.rss_kb;
-    total->pss_kb += memory.pss_kb;
-    total->pss_anon_kb += memory.pss_anon_kb;
-    total->pss_file_kb += memory.pss_file_kb;
-    total->pss_shmem_kb += memory.pss_shmem_kb;
-    total->shared_clean_kb += memory.shared_clean_kb;
-    total->shared_dirty_kb += memory.shared_dirty_kb;
-    total->private_clean_kb += memory.private_clean_kb;
-    total->private_dirty_kb += memory.private_dirty_kb;
-    total->private_hugetlb_kb += memory.private_hugetlb_kb;
-    total->anonymous_kb += memory.anonymous_kb;
-    total->swap_kb += memory.swap_kb;
-    total->swap_pss_kb += memory.swap_pss_kb;
-
-#define MERGE_AVAILABILITY(field) \
-    total->field = first ? memory.field : total->field && memory.field
-    MERGE_AVAILABILITY(rss_available);
-    MERGE_AVAILABILITY(pss_available);
-    MERGE_AVAILABILITY(pss_anon_available);
-    MERGE_AVAILABILITY(pss_file_available);
-    MERGE_AVAILABILITY(pss_shmem_available);
-    MERGE_AVAILABILITY(shared_clean_available);
-    MERGE_AVAILABILITY(shared_dirty_available);
-    MERGE_AVAILABILITY(private_clean_available);
-    MERGE_AVAILABILITY(private_dirty_available);
-    MERGE_AVAILABILITY(private_hugetlb_available);
-    MERGE_AVAILABILITY(swap_available);
-    MERGE_AVAILABILITY(swap_pss_available);
-#undef MERGE_AVAILABILITY
-}
-
-void write_optional_kb(std::ostream& output, unsigned long value, bool available) {
-    if (available) {
-        output << value;
-    }
-}
-
-bool read_smaps_file(const std::string& path, smaps_metrics* metrics) {
-    std::ifstream input(path);
-    if (!input) {
-        return false;
-    }
-    std::string line;
-    while (std::getline(input, line)) {
-        const std::size_t colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-        const std::string key = line.substr(0, colon);
-        const char* value_text = line.c_str() + colon + 1;
-        char* end = nullptr;
-        errno = 0;
-        const unsigned long value = std::strtoul(value_text, &end, 10);
-        if (errno != 0 || end == value_text) {
-            continue;
-        }
-        add_smaps_field(metrics, key, value);
-    }
-    return !input.bad() && metrics->rss_available && metrics->pss_available;
-}
-
-smaps_metrics read_smaps_metrics(pid_t pid) {
-    smaps_metrics metrics;
-    const std::string proc_root = "/proc/" + std::to_string(pid) + "/";
-    if (!read_smaps_file(proc_root + "smaps_rollup", &metrics)) {
-        metrics = smaps_metrics {};
-        if (!read_smaps_file(proc_root + "smaps", &metrics)) {
-            abend("could not read smaps data for process %d: %s\n", pid,
-                  std::strerror(errno));
-        }
-    }
-    return metrics;
-}
+using linux_procfs::SmapsMetrics;
 
 struct process_memory_record {
     pid_t pid;
     pid_t parent;
     std::string command;
-    smaps_metrics memory;
+    SmapsMetrics memory;
 };
+
+OptionalKb optional_kb(unsigned long value, bool available) {
+    return OptionalKb {value, available};
+}
+
+ProcessMemory make_process_memory(pid_t pid, pid_t parent, const std::string& command,
+                                  const SmapsMetrics& memory) {
+    ProcessMemory result;
+    result.pid = pid;
+    result.ppid = parent;
+    result.command = command;
+    result.vsize_kb = memory.size_kb;
+    result.rss_kb = optional_kb(memory.rss_kb, memory.rss_available);
+    result.pss_kb = optional_kb(memory.pss_kb, memory.pss_available);
+    result.uss_kb = optional_kb(memory.private_clean_kb + memory.private_dirty_kb +
+                                    memory.private_hugetlb_kb,
+                                linux_procfs::uss_available(memory));
+    result.pss_anon_kb = optional_kb(memory.pss_anon_kb, memory.pss_anon_available);
+    result.pss_file_kb = optional_kb(memory.pss_file_kb, memory.pss_file_available);
+    result.pss_shmem_kb = optional_kb(memory.pss_shmem_kb, memory.pss_shmem_available);
+    result.shared_clean_kb =
+        optional_kb(memory.shared_clean_kb, memory.shared_clean_available);
+    result.shared_dirty_kb =
+        optional_kb(memory.shared_dirty_kb, memory.shared_dirty_available);
+    result.private_clean_kb =
+        optional_kb(memory.private_clean_kb, memory.private_clean_available);
+    result.private_dirty_kb =
+        optional_kb(memory.private_dirty_kb, memory.private_dirty_available);
+    result.swap_kb = optional_kb(memory.swap_kb, memory.swap_available);
+    result.swap_pss_kb = optional_kb(memory.swap_pss_kb, memory.swap_pss_available);
+    return result;
+}
 
 std::string sanitize_tsv(std::string value) {
     for (char& character : value) {
@@ -1782,7 +1491,7 @@ std::string sanitize_tsv(std::string value) {
 
 void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
     std::vector<process_memory_record> records;
-    smaps_metrics total;
+    SmapsMetrics total;
     for (pid_t pid : tree) {
         std::vector<std::string> fields;
         std::string command;
@@ -1797,7 +1506,11 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
         const pid_t parent = end != fields[1].c_str() && *end == '\0'
                                  ? static_cast<pid_t>(parent_value)
                                  : 0;
-        smaps_metrics memory = read_smaps_metrics(pid);
+        SmapsMetrics memory;
+        std::string memory_reason;
+        if (!linux_procfs::read_smaps_metrics(pid, &memory, &memory_reason)) {
+            abend("%s\n", memory_reason.c_str());
+        }
         // smaps_rollup does not expose Size on every supported kernel; stat's
         // vsize is the authoritative process-wide virtual address size.
         if (fields.size() > 20) {
@@ -1805,16 +1518,15 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
         }
         records.push_back(process_memory_record {pid, parent, command, memory});
 
-        merge_smaps_metrics(&total, memory, records.size() == 1);
+        linux_procfs::merge_smaps_metrics(&total, memory, records.size() == 1);
     }
 
-    const unsigned long total_uss_kb =
-        total.private_clean_kb + total.private_dirty_kb + total.private_hugetlb_kb;
+    const unsigned long total_uss_kb = linux_procfs::uss_kb(total);
     add_metric("Process tree count", records.size(), "Processes");
     add_metric("Process tree virtual size", total.size_kb, "KB");
     if (total.rss_available) add_metric("Process tree RSS", total.rss_kb, "KB");
     if (total.pss_available) add_metric("Process tree PSS", total.pss_kb, "KB");
-    if (uss_available(total)) add_metric("Process tree USS", total_uss_kb, "KB");
+    if (linux_procfs::uss_available(total)) add_metric("Process tree USS", total_uss_kb, "KB");
     if (total.pss_anon_available)
         add_metric("Process tree anonymous", total.pss_anon_kb, "KB PSS");
     if (total.pss_file_available)
@@ -1825,71 +1537,47 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
     if (total.swap_pss_available)
         add_metric("Process tree swap PSS", total.swap_pss_kb, "KB");
 
-    const std::string output_name =
-        output_path("process_tree_memory_" + std::to_string(root_pid) + ".tsv");
-    std::string output_reason;
-    std::ostringstream output;
-    output << "pid\tppid\tcommand\tvsize_kb\trss_kb\tpss_kb\tuss_kb\tpss_anon_kb\t"
-              "pss_file_kb\tpss_shmem_kb\tshared_clean_kb\tshared_dirty_kb\t"
-              "private_clean_kb\tprivate_dirty_kb\tswap_kb\tswap_pss_kb\n";
-    for (const process_memory_record& record : records) {
-        const smaps_metrics& memory = record.memory;
-        const unsigned long uss_kb =
-            memory.private_clean_kb + memory.private_dirty_kb + memory.private_hugetlb_kb;
-        output << record.pid << '\t' << record.parent << '\t' << sanitize_tsv(record.command)
-               << '\t' << memory.size_kb << '\t';
-        write_optional_kb(output, memory.rss_kb, memory.rss_available);
-        output << '\t';
-        write_optional_kb(output, memory.pss_kb, memory.pss_available);
-        output << '\t';
-        write_optional_kb(output, uss_kb, uss_available(memory));
-        output << '\t';
-        write_optional_kb(output, memory.pss_anon_kb, memory.pss_anon_available);
-        output << '\t';
-        write_optional_kb(output, memory.pss_file_kb, memory.pss_file_available);
-        output << '\t';
-        write_optional_kb(output, memory.pss_shmem_kb, memory.pss_shmem_available);
-        output << '\t';
-        write_optional_kb(output, memory.shared_clean_kb, memory.shared_clean_available);
-        output << '\t';
-        write_optional_kb(output, memory.shared_dirty_kb, memory.shared_dirty_available);
-        output << '\t';
-        write_optional_kb(output, memory.private_clean_kb, memory.private_clean_available);
-        output << '\t';
-        write_optional_kb(output, memory.private_dirty_kb, memory.private_dirty_available);
-        output << '\t';
-        write_optional_kb(output, memory.swap_kb, memory.swap_available);
-        output << '\t';
-        write_optional_kb(output, memory.swap_pss_kb, memory.swap_pss_available);
-        output << '\n';
+    // Build one canonical report before serializing it. Keeping measurement and
+    // presentation separate guarantees that every requested format describes
+    // the exact same frozen process-tree snapshot.
+    MemoryReport report;
+    report.root_pid = root_pid;
+    report.launcher_pid = original_launcher_pid;
+    report.timestamp_ns = static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    report.freeze_backend = selected_freeze_backend;
+    report.cgroup_path = selected_cgroup_path;
+    for (const auto& capture : jvm_capture_status) {
+        report.runtime_status[capture.first] = capture.second.status;
     }
-    output << "TOTAL\t\t" << records.size() << " processes\t" << total.size_kb << '\t';
-    write_optional_kb(output, total.rss_kb, total.rss_available);
-    output << '\t';
-    write_optional_kb(output, total.pss_kb, total.pss_available);
-    output << '\t';
-    write_optional_kb(output, total_uss_kb, uss_available(total));
-    output << '\t';
-    write_optional_kb(output, total.pss_anon_kb, total.pss_anon_available);
-    output << '\t';
-    write_optional_kb(output, total.pss_file_kb, total.pss_file_available);
-    output << '\t';
-    write_optional_kb(output, total.pss_shmem_kb, total.pss_shmem_available);
-    output << '\t';
-    write_optional_kb(output, total.shared_clean_kb, total.shared_clean_available);
-    output << '\t';
-    write_optional_kb(output, total.shared_dirty_kb, total.shared_dirty_available);
-    output << '\t';
-    write_optional_kb(output, total.private_clean_kb, total.private_clean_available);
-    output << '\t';
-    write_optional_kb(output, total.private_dirty_kb, total.private_dirty_available);
-    output << '\t';
-    write_optional_kb(output, total.swap_kb, total.swap_available);
-    output << '\t';
-    write_optional_kb(output, total.swap_pss_kb, total.swap_pss_available);
-    output << '\n';
-    if (!write_atomic_text(output_name, output.str(), &output_reason)) {
-        abend("%s\n", output_reason.c_str());
+    for (const process_memory_record& record : records) {
+        report.processes.push_back(
+            make_process_memory(record.pid, record.parent, record.command, record.memory));
+    }
+    report.total = make_process_memory(0, 0, std::to_string(records.size()) + " processes", total);
+
+    const auto write_report = [&](const std::string& filename, const std::string& contents) {
+        std::string reason;
+        if (!write_atomic_text(output_path(filename), contents, &reason)) {
+            abend("%s\n", reason.c_str());
+        }
+    };
+    if (requested_report_format == ReportFormat::tsv ||
+        requested_report_format == ReportFormat::all) {
+        write_report("process_tree_memory_" + std::to_string(root_pid) + ".tsv",
+                     render_tsv(report));
+    }
+    if (requested_report_format == ReportFormat::json ||
+        requested_report_format == ReportFormat::all) {
+        write_report("memory_report_" + std::to_string(root_pid) + ".json",
+                     render_json(report));
+    }
+    if (requested_report_format == ReportFormat::html ||
+        requested_report_format == ReportFormat::all) {
+        write_report("memory_report_" + std::to_string(root_pid) + ".html",
+                     render_html(report));
     }
 }
 
@@ -1936,15 +1624,6 @@ void run_snapshot_command(const std::string& executable, const std::vector<std::
     if (!commit_secure_temp(&temporary, output_name, &reason)) {
         abend("%s\n", reason.c_str());
     }
-}
-
-std::string trim_copy(const std::string& value) {
-    const std::size_t first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-        return {};
-    }
-    const std::size_t last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
 }
 
 bool process_is_hotspot(pid_t pid) {
@@ -2071,25 +1750,6 @@ std::string read_text_file(const std::string& path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-bool parse_nmt_value_kb(const std::string& line, const char* key, unsigned long* value) {
-    const std::size_t position = line.find(key);
-    if (position == std::string::npos) {
-        return false;
-    }
-    const char* start = line.c_str() + position + std::strlen(key);
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long parsed = std::strtoul(start, &end, 10);
-    if (errno != 0 || end == start) {
-        return false;
-    }
-    if (std::strncmp(end, "KB", 2) != 0 && *end != ',' && *end != ')') {
-        return false;
-    }
-    *value = parsed;
-    return true;
-}
-
 std::size_t write_nmt_tsv(pid_t pid, const std::string& raw_output,
                           const runtime_capture_metadata& metadata) {
     const std::string output_name = output_path("jvm_nmt_" + std::to_string(pid) + ".tsv");
@@ -2097,38 +1757,21 @@ std::size_t write_nmt_tsv(pid_t pid, const std::string& raw_output,
     std::ostringstream output;
     output << "pid\truntime\truntime_version\ttimestamp_ns\tduration_ns\tmethod\tforced_gc\t"
               "category\treserved_kb\tcommitted_kb\tunit\n";
-    std::istringstream lines(raw_output);
-    std::string line;
-    std::size_t categories = 0;
-    while (std::getline(lines, line)) {
-        const std::string trimmed = trim_copy(line);
-        std::string category;
-        if (trimmed.rfind("Total:", 0) == 0) {
-            category = "Total";
-        } else if (!trimmed.empty() && trimmed[0] == '-') {
-            const std::size_t parenthesis = trimmed.find('(');
-            if (parenthesis != std::string::npos) {
-                category = trim_copy(trimmed.substr(1, parenthesis - 1));
-            }
-        }
-        unsigned long reserved_kb = 0;
-        unsigned long committed_kb = 0;
-        if (category.empty() || !parse_nmt_value_kb(trimmed, "reserved=", &reserved_kb) ||
-            !parse_nmt_value_kb(trimmed, "committed=", &committed_kb)) {
-            continue;
-        }
+    const std::vector<hotspot_nmt::Category> categories =
+        hotspot_nmt::parse_summary(raw_output);
+    for (const hotspot_nmt::Category& category : categories) {
         output << pid << '\t' << metadata.runtime << '\t'
                << sanitize_tsv(metadata.runtime_version) << '\t' << metadata.timestamp_ns << '\t'
                << metadata.duration_ns << '\t' << sanitize_tsv(metadata.method) << '\t'
-               << (metadata.forced_gc ? "true" : "false") << '\t' << sanitize_tsv(category)
-               << '\t' << reserved_kb << '\t' << committed_kb << '\t' << metadata.units << '\n';
-        ++categories;
+               << (metadata.forced_gc ? "true" : "false") << '\t'
+               << sanitize_tsv(category.name) << '\t' << category.reserved_kb << '\t'
+               << category.committed_kb << '\t' << metadata.units << '\n';
     }
     if (!write_atomic_text(output_name, output.str(), &reason)) {
         d_printf(1, "%s\n", reason.c_str());
         return 0;
     }
-    return categories;
+    return categories.size();
 }
 
 void capture_jvm_nmt(fp_prochandle* fp_proc, pid_t pid, unsigned long expected_start_time) {
@@ -2537,155 +2180,31 @@ void analyze(char** argv) {
     release_output_lock();
 }
 
-long parse_positive(const char* value, const char* option) {
-    errno = 0;
-    char* end = nullptr;
-    const long result = std::strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || result < 1) {
-        cli_error("%s requires a positive integer, got '%s'", option, value);
-    }
-    return result;
-}
-
 }  // namespace
 
-int main(int argc, char** argv) {
-    if (argv != nullptr && argv[0] != nullptr) {
-        const char* slash = std::strrchr(argv[0], '/');
-        program_name = slash == nullptr ? argv[0] : slash + 1;
-    }
-    if (argc < 2 || argv == nullptr || argv[0] == nullptr) {
-        cli_error("a command or --pid PID is required");
-    }
+int run_capture(const CommandLine& command_line, char** argv) {
+    const CaptureConfig& config = command_line.config;
+    program_name = command_line.program_name.c_str();
+    debug_level = config.debug_level;
+    wait_time = config.wait_time;
+    quiet_window_seconds = config.quiet_window_seconds;
+    quiescence_timeout_seconds = config.quiescence_timeout_seconds;
+    quiet_mode = config.quiet;
+    requested_freeze_mode = config.freeze_mode;
+    requested_report_format = config.report_format;
+    jcmd_enabled = config.jcmd_enabled;
+    enable_jvm_nmt = config.enable_jvm_nmt;
+    requested_launch_cgroup = config.launch_cgroup;
+    artifact_store = std::make_unique<ArtifactStore>(config.output_directory);
+    std::string output_reason;
+    if (!artifact_store->prepare(&output_reason)) throw cli::Error(output_reason);
 
-    pid_t pid = -1;
-    int index = 1;
-    while (index < argc && argv[index] != nullptr && argv[index][0] == '-') {
-        if (std::strcmp(argv[index], "--") == 0) {
-            ++index;
-            break;
-        }
-        if (std::strcmp(argv[index], "-h") == 0 ||
-            std::strcmp(argv[index], "--help") == 0) {
-            print_help(stdout);
-            return 0;
-        }
-        if (std::strcmp(argv[index], "-V") == 0 ||
-            std::strcmp(argv[index], "--version") == 0) {
-            std::printf("memftprt %s\n", MEMFTPRT_VERSION);
-            return 0;
-        }
-        if (std::strcmp(argv[index], "-p") == 0 ||
-            std::strcmp(argv[index], "--pid") == 0) {
-            if (++index >= argc) {
-                cli_error("%s requires a PID", argv[index - 1]);
-            }
-            const long value = parse_positive(argv[index], argv[index - 1]);
-            ++index;
-            if (value > std::numeric_limits<pid_t>::max()) {
-                cli_error("PID is outside the supported range");
-            }
-            pid = static_cast<pid_t>(value);
-        } else if (std::strcmp(argv[index], "-t") == 0 ||
-                   std::strcmp(argv[index], "--delay") == 0) {
-            if (++index >= argc) {
-                cli_error("%s requires a duration in seconds", argv[index - 1]);
-            }
-            const long value = parse_positive(argv[index], argv[index - 1]);
-            ++index;
-            if (value > std::numeric_limits<int>::max()) {
-                cli_error("delay is outside the supported range");
-            }
-            wait_time = static_cast<int>(value);
-        } else if (std::strcmp(argv[index], "-q") == 0 ||
-                   std::strcmp(argv[index], "--stable-window") == 0) {
-            if (++index >= argc) {
-                cli_error("%s requires a duration in seconds", argv[index - 1]);
-            }
-            const unsigned long value =
-                static_cast<unsigned long>(parse_positive(argv[index], argv[index - 1]));
-            ++index;
-            if (value > std::numeric_limits<unsigned>::max()) {
-                cli_error("stable window is outside the supported range");
-            }
-            quiet_window_seconds = static_cast<unsigned>(value);
-        } else if (std::strcmp(argv[index], "-m") == 0 ||
-                   std::strcmp(argv[index], "--timeout") == 0) {
-            if (++index >= argc) {
-                cli_error("%s requires a duration in seconds", argv[index - 1]);
-            }
-            const unsigned long value =
-                static_cast<unsigned long>(parse_positive(argv[index], argv[index - 1]));
-            ++index;
-            if (value > std::numeric_limits<unsigned>::max()) {
-                cli_error("timeout is outside the supported range");
-            }
-            quiescence_timeout_seconds = static_cast<unsigned>(value);
-        } else if (std::strcmp(argv[index], "-o") == 0 ||
-                   std::strcmp(argv[index], "--output-dir") == 0) {
-            if (++index >= argc) {
-                cli_error("%s requires a directory", argv[index - 1]);
-            }
-            output_directory = argv[index++];
-        } else if (std::strcmp(argv[index], "--quiet") == 0) {
-            quiet_mode = true;
-            ++index;
-        } else if (std::strcmp(argv[index], "-v") == 0 ||
-                   std::strcmp(argv[index], "--verbose") == 0) {
-            ++debug_level;
-            ++index;
-        } else if (std::strcmp(argv[index], "--freeze") == 0) {
-            if (++index >= argc) {
-                cli_error("--freeze requires auto, cgroup, or signals");
-            }
-            if (std::strcmp(argv[index], "auto") == 0) {
-                requested_freeze_mode = freeze_mode::automatic;
-            } else if (std::strcmp(argv[index], "cgroup") == 0) {
-                requested_freeze_mode = freeze_mode::cgroup;
-            } else if (std::strcmp(argv[index], "signals") == 0) {
-                requested_freeze_mode = freeze_mode::signals;
-            } else {
-                cli_error("unknown freeze mode '%s'; expected auto, cgroup, or signals",
-                          argv[index]);
-            }
-            ++index;
-        } else if (std::strcmp(argv[index], "--cgroup") == 0) {
-            if (++index >= argc) {
-                cli_error("--cgroup requires a delegated cgroup v2 path");
-            }
-            requested_launch_cgroup = argv[index++];
-        } else if (std::strcmp(argv[index], "--no-jcmd") == 0) {
-            jcmd_enabled = false;
-            ++index;
-        } else if (std::strcmp(argv[index], "--enable-jvm-nmt") == 0) {
-            enable_jvm_nmt = true;
-            ++index;
-        } else {
-            cli_error("unknown option '%s'", argv[index]);
-        }
-    }
-
-    if (pid != -1) {
-        if (enable_jvm_nmt || !requested_launch_cgroup.empty()) {
-            cli_error("--enable-jvm-nmt and --cgroup are launch-only options");
-        }
-        if (index != argc) {
-            cli_error("a command cannot be combined with --pid");
-        }
-        prepare_output_directory();
-        analyze_pid(pid);
+    if (command_line.target_pid != -1) {
+        analyze_pid(static_cast<pid_t>(command_line.target_pid));
     } else {
-        if (index >= argc) {
-            cli_error("a command or --pid PID is required");
-        }
-        if (!requested_launch_cgroup.empty()) {
-            if (requested_freeze_mode == freeze_mode::signals) {
-                cli_error("--cgroup conflicts with --freeze signals");
-            }
-            requested_freeze_mode = freeze_mode::cgroup;
-        }
-        prepare_output_directory();
-        analyze(argv + index);
+        analyze(argv + command_line.command_index);
     }
     return exiting == 0 ? 0 : 128 + static_cast<int>(exiting);
 }
+
+}  // namespace memftprt
