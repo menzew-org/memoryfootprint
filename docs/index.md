@@ -98,6 +98,11 @@ their mappers. Then inspect per-process rows and mappings to locate the cost.
     <strong>Follow lifecycle ownership and artifact publication</strong>
     <em>Read the architecture →</em>
   </a>
+  <a href="{{ '/studies/openjdk-8-25-memory-footprint/' | relative_url }}">
+    <span>Measured study</span>
+    <strong>Compare controlled OpenJDK 8–25 footprints</strong>
+    <em>Read the results →</em>
+  </a>
 </div>
 
 More commands are available in the

@@ -25,6 +25,8 @@
              href="{{ '/capture-model/' | relative_url }}">Capture model</a>
           <a {% if page.url contains '/adapters/' or page.url == '/runtime-adapters/' %}aria-current="page"{% endif %}
              href="{{ '/runtime-adapters/' | relative_url }}">Adapters</a>
+          <a {% if page.url contains '/studies/' %}aria-current="page"{% endif %}
+             href="{{ '/studies/openjdk-8-25-memory-footprint/' | relative_url }}">Studies</a>
           <a class="repo-link" href="https://github.com/menzew/memoryfootprint">GitHub</a>
         </nav>
         <details class="mobile-menu">
@@ -33,6 +35,7 @@
             <a href="{{ '/understanding-output/' | relative_url }}">Understand output</a>
             <a href="{{ '/capture-model/' | relative_url }}">Capture model</a>
             <a href="{{ '/runtime-adapters/' | relative_url }}">Runtime adapters</a>
+            <a href="{{ '/studies/openjdk-8-25-memory-footprint/' | relative_url }}">OpenJDK 8–25 study</a>
             <a href="{{ '/architecture/' | relative_url }}">Architecture</a>
             <a href="https://github.com/menzew/memoryfootprint">GitHub repository</a>
           </nav>

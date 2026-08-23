@@ -1,0 +1,203 @@
+{
+  "nmt_modes": [
+    "on"
+  ],
+  "profiles": [
+    "controlled"
+  ],
+  "schema_version": 1,
+  "studies": [
+    {
+      "created_at": "2026-08-23T06:43:19.944905+00:00",
+      "host": {
+        "allowed_cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "logical_cpus": 12,
+        "memory_kb": 263809432,
+        "platform": "Linux-6.8.0-137-generic-x86_64-with-glibc2.39",
+        "uname": [
+          "Linux",
+          "Ubuntu-2404-noble-amd64-base",
+          "6.8.0-137-generic",
+          "#137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026",
+          "x86_64",
+          "x86_64"
+        ]
+      },
+      "input_sha256": {
+        "build/memftprt": "e474cc4ea17a8210dfec0583dd2a88bbfe5d0881e5dbfe94946b5d6768ce5e19",
+        "studies/jvm-footprint/jdk-manifest.tsv": "4fb993783f67f844c63b0c7c605a3447026a0b47886e748a5cec614af88b785a",
+        "studies/jvm-footprint/scripts/run_study.py": "4d680f36c3e4b96efc290ed7880a9fc583aaa9dfd2c505fd5a30154cf5f36996",
+        "studies/jvm-footprint/src/HelloIdle.java": "4459b085d6d944d32b22bca0809ca9e0f03a36a383137b99b46716f8448cbc57",
+        "studies/jvm-footprint/src/RuntimeExercise.java": "26041760e943aa33232b9003accecd61f98c9a50aeb558b42c76c97a625502d2",
+        "studies/jvm-footprint/src/StudySupport.java": "71bf95ece068ef79eeb0955a846fca9cf7c4a406a44dc666eb3bacc7fc09c3e5"
+      },
+      "openjdk": [
+        {
+          "archive_name": "openjdk-8u44-linux-x64.tar.gz",
+          "build": "8u44-b02",
+          "sha256": "d040593171ef3eee270c2a8c79c4ca8a70f7813709f5b6cc309d0dde9d5d7ebb",
+          "url": "https://download.java.net/openjdk/jdk8u44/ri/openjdk-8u44-linux-x64.tar.gz",
+          "version": "8"
+        },
+        {
+          "archive_name": "openjdk-9_linux-x64_bin.tar.gz",
+          "build": "9+181",
+          "sha256": "f908e31b6185e11b322825809172dcbb7ac0dce64061c9cf154cb1b0df884480",
+          "url": "https://download.java.net/java/GA/jdk9/9/binaries/openjdk-9_linux-x64_bin.tar.gz",
+          "version": "9"
+        },
+        {
+          "archive_name": "openjdk-10_linux-x64_bin.tar.gz",
+          "build": "10+46",
+          "sha256": "c851df838a51af52517b74e3a4b251d90c54cf478a4ebed99e7285ef134c3435",
+          "url": "https://download.java.net/java/GA/jdk10/10/binaries/openjdk-10_linux-x64_bin.tar.gz",
+          "version": "10"
+        },
+        {
+          "archive_name": "openjdk-11_linux-x64_bin.tar.gz",
+          "build": "11+28",
+          "sha256": "3784cfc4670f0d4c5482604c7c513beb1a92b005f569df9bf100e8bef6610f2e",
+          "url": "https://download.java.net/java/ga/jdk11/openjdk-11_linux-x64_bin.tar.gz",
+          "version": "11"
+        },
+        {
+          "archive_name": "openjdk-12_linux-x64_bin.tar.gz",
+          "build": "12+33",
+          "sha256": "b43bc15f4934f6d321170419f2c24451486bc848a2179af5e49d10721438dd56",
+          "url": "https://download.java.net/java/GA/jdk12/33/GPL/openjdk-12_linux-x64_bin.tar.gz",
+          "version": "12"
+        },
+        {
+          "archive_name": "openjdk-13_linux-x64_bin.tar.gz",
+          "build": "13+33",
+          "sha256": "5f547b8f0ffa7da517223f6f929a5055d749776b1878ccedbd6cc1334f4d6f4d",
+          "url": "https://download.java.net/java/GA/jdk13/5b8a42f3905b406298b72d750b6919f6/33/GPL/openjdk-13_linux-x64_bin.tar.gz",
+          "version": "13"
+        },
+        {
+          "archive_name": "openjdk-14_linux-x64_bin.tar.gz",
+          "build": "14+36",
+          "sha256": "c7006154dfb8b66328c6475447a396feb0042608ee07a96956547f574a911c09",
+          "url": "https://download.java.net/java/GA/jdk14/076bab302c7b4508975440c56f6cc26a/36/GPL/openjdk-14_linux-x64_bin.tar.gz",
+          "version": "14"
+        },
+        {
+          "archive_name": "openjdk-15_linux-x64_bin.tar.gz",
+          "build": "15+36",
+          "sha256": "bb67cadee687d7b486583d03c9850342afea4593be4f436044d785fba9508fb7",
+          "url": "https://download.java.net/java/GA/jdk15/779bf45e88a44cbd9ea6621d33e33db1/36/GPL/openjdk-15_linux-x64_bin.tar.gz",
+          "version": "15"
+        },
+        {
+          "archive_name": "openjdk-16_linux-x64_bin.tar.gz",
+          "build": "16+36",
+          "sha256": "e952958f16797ad7dc7cd8b724edd69ec7e0e0434537d80d6b5165193e33b931",
+          "url": "https://download.java.net/java/GA/jdk16/7863447f0ab643c585b9bdebf67c69db/36/GPL/openjdk-16_linux-x64_bin.tar.gz",
+          "version": "16"
+        },
+        {
+          "archive_name": "openjdk-17_linux-x64_bin.tar.gz",
+          "build": "17+35",
+          "sha256": "aef49cc7aa606de2044302e757fa94c8e144818e93487081c4fd319ca858134b",
+          "url": "https://download.java.net/java/GA/jdk17/0d483333a00540d886896bac774ff48b/35/GPL/openjdk-17_linux-x64_bin.tar.gz",
+          "version": "17"
+        },
+        {
+          "archive_name": "openjdk-18_linux-x64_bin.tar.gz",
+          "build": "18+36",
+          "sha256": "0f60aef7b8504983d6e374fe94d09a7bedcf05ec559e812d801a33bd4ebd23d0",
+          "url": "https://download.java.net/java/GA/jdk18/43f95e8614114aeaa8e8a5fcf20a682d/36/GPL/openjdk-18_linux-x64_bin.tar.gz",
+          "version": "18"
+        },
+        {
+          "archive_name": "openjdk-19_linux-x64_bin.tar.gz",
+          "build": "19+36",
+          "sha256": "f47aba585cfc9ecff1ed8e023524e8309f4315ed8b80100b40c7dcc232c12f96",
+          "url": "https://download.java.net/java/GA/jdk19/877d6127e982470ba2a7faa31cc93d04/36/GPL/openjdk-19_linux-x64_bin.tar.gz",
+          "version": "19"
+        },
+        {
+          "archive_name": "openjdk-20_linux-x64_bin.tar.gz",
+          "build": "20+36",
+          "sha256": "bb863b2d542976d1ae4b7b81af3e78b1e4247a64644350b552d298d8dc5980dc",
+          "url": "https://download.java.net/java/GA/jdk20/bdc68b4b9cbc4ebcb30745c85038d91d/36/GPL/openjdk-20_linux-x64_bin.tar.gz",
+          "version": "20"
+        },
+        {
+          "archive_name": "openjdk-21_linux-x64_bin.tar.gz",
+          "build": "21+35",
+          "sha256": "a30c454a9bef8f46d5f1bf3122830014a8fbe7ac03b5f8729bc3add4b92a1d0a",
+          "url": "https://download.java.net/java/GA/jdk21/fd2272bbf8e04c3dbaee13770090416c/35/GPL/openjdk-21_linux-x64_bin.tar.gz",
+          "version": "21"
+        },
+        {
+          "archive_name": "openjdk-22_linux-x64_bin.tar.gz",
+          "build": "22+36",
+          "sha256": "4d65cc6ed28711768fd72c2043a7925f7c83f5f51bb64970bd9d52f7791fc6ac",
+          "url": "https://download.java.net/java/GA/jdk22/830ec9fcccef480bb3e73fb7ecafe059/36/GPL/openjdk-22_linux-x64_bin.tar.gz",
+          "version": "22"
+        },
+        {
+          "archive_name": "openjdk-23_linux-x64_bin.tar.gz",
+          "build": "23+37",
+          "sha256": "08fea92724127c6fa0f2e5ea0b07ff4951ccb1e2f22db3c21eebbd7347152a67",
+          "url": "https://download.java.net/java/GA/jdk23/3c5b90190c68498b986a97f276efd28a/37/GPL/openjdk-23_linux-x64_bin.tar.gz",
+          "version": "23"
+        },
+        {
+          "archive_name": "openjdk-24_linux-x64_bin.tar.gz",
+          "build": "24+36",
+          "sha256": "88b090fa80c6c1d084ec9a755233967458788e2c0777ae2e172230c5c692d7ef",
+          "url": "https://download.java.net/java/GA/jdk24/1f9ff9062db4449d8ca828c504ffae90/36/GPL/openjdk-24_linux-x64_bin.tar.gz",
+          "version": "24"
+        },
+        {
+          "archive_name": "openjdk-25_linux-x64_bin.tar.gz",
+          "build": "25+36",
+          "sha256": "59cdcaf255add4721de38eb411d4ecfe779356b61fb671aee63c7dec78054c2b",
+          "url": "https://download.java.net/java/GA/jdk25/bd75d5f9689641da8e1daabeccb5528b/36/GPL/openjdk-25_linux-x64_bin.tar.gz",
+          "version": "25"
+        }
+      ]
+    }
+  ],
+  "successful_captures": 180,
+  "summarizer_sha256": "7bc61268ec81b91099cc096830fb93c5580bd661feb9c7ed8f0d34581fbf0b6d",
+  "versions": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25
+  ],
+  "workloads": [
+    "exercise",
+    "hello"
+  ]
+}

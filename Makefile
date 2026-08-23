@@ -26,7 +26,7 @@ MODULE_TEST_SOURCES := tests/module_test.cpp src/artifact_store.cpp src/memory_r
 MODULE_TEST_OBJECTS := $(patsubst %.cpp,build/obj/%.o,$(MODULE_TEST_SOURCES))
 DEPENDENCIES := $(sort $(OBJECTS:.o=.d) $(MODULE_TEST_OBJECTS:.o=.d))
 
-.PHONY: all clean install test
+.PHONY: all clean install test study-test
 
 all: $(TARGET)
 
@@ -62,6 +62,10 @@ test: $(TARGET) $(TEST_TARGET) $(SIGNAL_TEST_TARGET) $(LIFECYCLE_TEST_TARGET) \
 	$(WORKING_SET_TEST_TARGET) $(MODULE_TEST_TARGET)
 	./$(MODULE_TEST_TARGET)
 	./tests/smoke.sh
+	$(MAKE) study-test
+
+study-test:
+	python3 -m unittest discover -s studies/jvm-footprint/tests -p 'test_*.py'
 
 install: $(TARGET)
 	install -d "$(DESTDIR)$(BINDIR)"

@@ -285,6 +285,7 @@ integration test rather than silently skipping it.
 - [Capture model and freeze guarantees](docs/CAPTURE_MODEL.md)
 - [Runtime adapter design](docs/RUNTIME_ADAPTERS.md)
 - [HotSpot JVM adapter](docs/adapters/JVM.md)
+- [OpenJDK 8–25 memory-footprint study](docs/studies/openjdk-8-25-memory-footprint.md)
 - [Node.js adapter design](docs/adapters/NODE.md)
 - [Go adapter design](docs/adapters/GO.md)
 - [Code architecture](docs/ARCHITECTURE.md)

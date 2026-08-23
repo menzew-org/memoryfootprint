@@ -1,4 +1,7 @@
 /build/
+/.study-cache/
+/.study-results/
+__pycache__/
 
 /.memftprt_*.lock
 /*.tmp.*

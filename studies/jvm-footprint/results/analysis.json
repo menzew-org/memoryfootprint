@@ -1,0 +1,13 @@
+{
+  "exercise_captures": 90,
+  "exercise_duration_ms": {
+    "maximum": 150013,
+    "minimum": 150000
+  },
+  "pss_minus_committed_java_heap_mib": {
+    "maximum": 51.014,
+    "median": 44.991,
+    "minimum": 36.467
+  },
+  "pss_vs_committed_java_heap_pearson": 0.997153
+}
