@@ -15,18 +15,29 @@ jobs:
     - uses: actions/checkout@v7
     - name: Build
       run: make
-    - name: Prepare delegated cgroup v2
+    - name: Test with a delegated cgroup v2
+      shell: bash
       run: |
-        sudo mkdir -p /sys/fs/cgroup/memftprt-ci
-        sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/memftprt-ci
+        set -euo pipefail
+        cgroup_root=/sys/fs/cgroup
+        current_relative="$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+        current_cgroup="${cgroup_root}${current_relative}"
+        delegate="${current_cgroup}/memftprt-ci-delegate"
+        target="${delegate}/target"
+
+        cleanup() {
+          sudo sh -c "echo $$ > '$current_cgroup/cgroup.procs'" || true
+          sudo rmdir "$target" "$delegate" || true
+        }
+        trap cleanup EXIT
+
+        sudo mkdir -p "$target"
         sudo chown "$(id -u):$(id -g)" \
-          /sys/fs/cgroup/memftprt-ci/cgroup.procs \
-          /sys/fs/cgroup/memftprt-ci/cgroup.freeze
-    - name: Test
-      env:
-        MEMFTPRT_TEST_CGROUP: /sys/fs/cgroup/memftprt-ci
-        MEMFTPRT_REQUIRE_CGROUP_TEST: "1"
-      run: make test
-    - name: Clean up delegated cgroup
-      if: always()
-      run: sudo rmdir /sys/fs/cgroup/memftprt-ci || true
+          "$delegate/cgroup.procs" \
+          "$target/cgroup.procs" \
+          "$target/cgroup.freeze"
+        sudo sh -c "echo $$ > '$delegate/cgroup.procs'"
+
+        MEMFTPRT_TEST_CGROUP="$target" \
+        MEMFTPRT_REQUIRE_CGROUP_TEST=1 \
+          make test

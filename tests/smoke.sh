@@ -618,8 +618,16 @@ fi
 cgroup_test_status="skipped (set MEMFTPRT_TEST_CGROUP to an empty delegated cgroup)"
 if [[ -n ${MEMFTPRT_TEST_CGROUP:-} ]]; then
     cd "$tmp_dir/cgroup"
+    set +e
     "$binary" --cgroup "$MEMFTPRT_TEST_CGROUP" --working-set 1 -t 1 -v /bin/sleep 10 \
         >metrics.out 2>&1
+    status=$?
+    set -e
+    if [[ $status -ne 0 ]]; then
+        echo "cgroup integration capture failed with status $status" >&2
+        cat metrics.out >&2
+        exit "$status"
+    fi
     grep -q "freeze backend: cgroup" metrics.out
     grep -Eq $'^freeze_backend\t[0-9]+\tcgroup$' capture_metadata_*.tsv
     grep -Eq $'^working_set\t[0-9]+\tcaptured$' capture_metadata_*.tsv
