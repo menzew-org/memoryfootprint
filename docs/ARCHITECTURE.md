@@ -8,8 +8,8 @@ permalink: /architecture/
 # Code architecture
 
 `memftprt` separates user interface, capture policy, platform measurement, and
-presentation. The current implementation targets Linux and keeps configuration,
-measurement, and report serialization behind explicit module boundaries.
+presentation. It targets Linux and keeps configuration, measurement, and report
+serialization behind explicit module boundaries.
 
 ```text
 main.cpp
@@ -130,6 +130,6 @@ validity contract. Failed or interrupted output has no completion marker.
 Runtime adapters explain portions of the OS-level footprint; they do not add
 new memory to it. The HotSpot adapter records raw `jcmd` output, normalized NMT
 categories, and an explicit status. Follow the contract in
-[Runtime adapter design]({{ '/runtime-adapters/' | relative_url }}): bounded execution, stable process
+[Runtime adapter design](https://menzew.github.io/memoryfootprint/runtime-adapters/): bounded execution, stable process
 identity, no forced GC by default, explicit unavailable states, and separate
 runtime artifacts.

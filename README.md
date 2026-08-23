@@ -5,8 +5,8 @@ It waits for an application to settle, optionally collects HotSpot JVM Native
 Memory Tracking data, freezes the complete application tree, and writes both a
 readable summary and TSV, JSON, or self-contained HTML reports.
 
-The maintained C++17 implementation combines Linux process-tree accounting,
-quiescence detection, runtime-aware capture, and defensive lifecycle cleanup.
+`memftprt` combines Linux process-tree accounting, quiescence detection,
+runtime-aware capture, and defensive lifecycle cleanup.
 
 Read the hosted documentation at
 [menzew.github.io/memoryfootprint](https://menzew.github.io/memoryfootprint/).
@@ -156,7 +156,7 @@ acceptable.
 | `-t, --delay SEC` | Use a fixed delay instead of quiescence detection |
 | `-o, --output-dir DIR` | Write all capture artifacts to `DIR` |
 | `-f, --format tsv\|json\|html\|all` | Select the primary report format; default `tsv` |
-| `--freeze auto|cgroup|signals` | Select or require a freeze backend |
+| `--freeze MODE` | Select `auto`, `cgroup`, or `signals` freezing |
 | `--cgroup PATH` | Launch into an empty delegated cgroup v2 |
 | `--enable-jvm-nmt` | Enable NMT for a JVM launched by the tool |
 | `--no-jcmd` | Disable automatic JVM probing |
@@ -282,7 +282,11 @@ integration test rather than silently skipping it.
 ## Further reading
 
 - [Understanding the output](docs/UNDERSTANDING_OUTPUT.md)
+- [Capture model and freeze guarantees](docs/CAPTURE_MODEL.md)
 - [Runtime adapter design](docs/RUNTIME_ADAPTERS.md)
+- [HotSpot JVM adapter](docs/adapters/JVM.md)
+- [Node.js adapter design](docs/adapters/NODE.md)
+- [Go adapter design](docs/adapters/GO.md)
 - [Code architecture](docs/ARCHITECTURE.md)
 - [Examples](examples/README.md)
 - [Contributing](CONTRIBUTING.md)

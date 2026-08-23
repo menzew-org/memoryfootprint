@@ -18,26 +18,36 @@
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
           <span>memftprt</span>
         </a>
-        <nav aria-label="Documentation">
+        <nav class="desktop-nav" aria-label="Documentation">
           <a {% if page.url == '/understanding-output/' %}aria-current="page"{% endif %}
              href="{{ '/understanding-output/' | relative_url }}">Output</a>
-          <a {% if page.url == '/runtime-adapters/' %}aria-current="page"{% endif %}
-             href="{{ '/runtime-adapters/' | relative_url }}">Runtimes</a>
-          <a {% if page.url == '/architecture/' %}aria-current="page"{% endif %}
-             href="{{ '/architecture/' | relative_url }}">Architecture</a>
+          <a {% if page.url == '/capture-model/' %}aria-current="page"{% endif %}
+             href="{{ '/capture-model/' | relative_url }}">Capture model</a>
+          <a {% if page.url contains '/adapters/' or page.url == '/runtime-adapters/' %}aria-current="page"{% endif %}
+             href="{{ '/runtime-adapters/' | relative_url }}">Adapters</a>
           <a class="repo-link" href="https://github.com/menzew/memoryfootprint">GitHub</a>
         </nav>
+        <details class="mobile-menu">
+          <summary>Menu</summary>
+          <nav aria-label="Mobile documentation">
+            <a href="{{ '/understanding-output/' | relative_url }}">Understand output</a>
+            <a href="{{ '/capture-model/' | relative_url }}">Capture model</a>
+            <a href="{{ '/runtime-adapters/' | relative_url }}">Runtime adapters</a>
+            <a href="{{ '/architecture/' | relative_url }}">Architecture</a>
+            <a href="https://github.com/menzew/memoryfootprint">GitHub repository</a>
+          </nav>
+        </details>
       </div>
     </header>
 
     <main id="content" class="page-shell">
-      {% unless page.url == '/' %}
-      <div class="page-heading">
-        <p class="eyebrow">memftprt documentation</p>
-        <p>{{ page.description }}</p>
-      </div>
-      {% endunless %}
       <article class="prose{% if page.url == '/' %} home{% endif %}">
+        {% unless page.url == '/' %}
+        <header class="article-context">
+          <p><a href="{{ '/' | relative_url }}">Documentation</a><span aria-hidden="true">/</span>{{ page.title }}</p>
+          <p>{{ page.description }}</p>
+        </header>
+        {% endunless %}
         {{ content }}
       </article>
     </main>

@@ -84,12 +84,17 @@ their mappers. Then inspect per-process rows and mappings to locate the cost.
     <em>Read the output →</em>
   </a>
   <a href="{{ '/runtime-adapters/' | relative_url }}">
-    <span>Runtime model</span>
-    <strong>Relate JVM, Node.js, and Go memory to the OS view</strong>
-    <em>Explore runtimes →</em>
+    <span>Runtime adapters</span>
+    <strong>Open dedicated JVM, Node.js, and Go guides</strong>
+    <em>Choose an adapter →</em>
+  </a>
+  <a href="{{ '/capture-model/' | relative_url }}">
+    <span>Measurement model</span>
+    <strong>Follow settling, freezing, working set, and cleanup</strong>
+    <em>Read the capture model →</em>
   </a>
   <a href="{{ '/architecture/' | relative_url }}">
-    <span>Implementation</span>
+    <span>Code internals</span>
     <strong>Follow lifecycle ownership and artifact publication</strong>
     <em>Read the architecture →</em>
   </a>

@@ -1,149 +1,87 @@
 ---
 layout: default
-title: Runtime-aware capture
-description: How OS ownership and JVM, Node.js, or Go runtime measurements fit together.
+title: Runtime adapters
+description: Keep OS memory ownership separate from runtime explanations and attribution data.
 permalink: /runtime-adapters/
 ---
 
-# Runtime-aware memory capture
+# Runtime adapters
 
-`memftprt` should treat Linux memory accounting as the authoritative ownership
-layer and runtime introspection as an explanatory layer. Runtime reservations,
-committed heaps, and used heaps overlap RSS/PSS/USS and must not be added to
-those totals.
+The kernel report answers **how much physical and virtual memory belongs to the
+application tree**. A runtime adapter answers **what that runtime believes the
+memory is for**. These layers overlap, so runtime totals must never be added to
+RSS, PSS, or USS.
 
-## Capture sequence
-
-1. Discover the root process and all descendants. Launch mode uses Linux
-   child-subreaper semantics so double-forked descendants remain attributable;
-   terminal zombie/dead entries are omitted.
-2. Wait for tree-wide quiescence using CPU, resident/virtual memory, state, and
-   tree-membership stability.
-3. Detect runtimes and ask each available runtime adapter for a snapshot while
-   the target can still answer.
-4. Wait for a short quiet window again because introspection allocates memory
-   and CPU itself. Record the adapter duration and whether it requested a GC.
-5. Freeze the process tree. The implemented `auto` backend uses cgroup v2
-   `cgroup.freeze` only when the target is in a writable dedicated cgroup;
-   otherwise it uses the ptrace/SIGSTOP fallback.
-6. Capture `/proc/PID/smaps_rollup` for every process and aggregate PSS, USS,
-   RSS, sharing classes, and swap.
-7. Resume exactly the processes that the tool stopped.
-
-If the target was already in a job-control stop, preserve that state after the
-capture. Common termination signals request the same orderly thaw/resume path;
-they do not terminate the collector in the middle of a frozen snapshot.
-
-The default must never force garbage collection. A deliberate GC-before-capture
-mode can be useful for retained-heap experiments, but it changes the thing being
-measured and therefore needs an explicit option and an output flag.
-
-## Three result layers
-
-| Layer | Examples | Meaning |
+| Layer | Examples | Question answered |
 | --- | --- | --- |
-| OS ownership | RSS, PSS, USS, swap | Physical and swapped memory charged to the process tree |
-| Runtime state | heap reserved/committed/used, stacks, JIT/code, metadata, GC structures | Runtime explanation of its address space and allocators |
-| Attribution | classes, allocation sites, heap-profile samples | Optional, higher-cost diagnostic detail |
+| OS ownership | RSS, PSS, USS, swap | How much memory is resident, private, proportionally shared, or swapped? |
+| Runtime state | heap reserved/committed/used, stacks, code, metadata | How has the runtime organized its address space? |
+| Attribution | classes, allocation sites, profiles | Which application objects or call sites retained memory? |
 
-Every runtime result should include the PID, runtime/version when obtainable
-without another intrusive probe, timestamp,
-collection duration, units, collection method, and whether the probe forced a
-GC. Unknown or unavailable data must remain absent rather than be reported as
-zero.
+## Adapter status
 
-## JVM adapter
+<div class="guide-grid adapter-grid">
+  <a href="{{ '/adapters/jvm/' | relative_url }}">
+    <span>Available</span>
+    <strong>HotSpot JVM Native Memory Tracking</strong>
+    <em>JVM adapter →</em>
+  </a>
+  <a href="{{ '/adapters/node/' | relative_url }}">
+    <span>Design contract</span>
+    <strong>Node.js and V8 cooperative snapshot</strong>
+    <em>Node.js adapter →</em>
+  </a>
+  <a href="{{ '/adapters/go/' | relative_url }}">
+    <span>Design contract</span>
+    <strong>Go runtime metrics snapshot</strong>
+    <em>Go adapter →</em>
+  </a>
+</div>
 
-The implemented adapter detects HotSpot from the executable or a mapped
-`libjvm.so`, then queries Native Memory Tracking with:
+Only the JVM adapter is currently implemented. Node.js and Go targets still
+receive the complete OS-level process-tree report; their pages define a safe,
+cooperative design rather than claiming functionality that is not present.
 
-```text
-jcmd PID VM.native_memory summary scale=KB
-```
+## Common adapter contract
 
-NMT provides useful categories such as Java heap, classes, threads, code, GC,
-compiler, symbols, and internal memory. It is disabled by default, must be
-enabled when the JVM starts with `-XX:NativeMemoryTracking=summary` or `detail`,
-and adds overhead. The adapter reports `nmt_not_enabled`
-instead of silently substituting another number. NMT also does not account for
-all third-party native allocations, so kernel PSS/USS remains the ground truth.
+An adapter result needs enough context to remain interpretable later:
 
-For commands launched by `memftprt`, `--enable-jvm-nmt` injects summary NMT via
-`JAVA_TOOL_OPTIONS`. Attaching to an arbitrary JVM cannot retroactively enable
-it. An inherited NMT-off setting is overridden; an existing detail setting is
-preserved. The adapter keeps the raw `jcmd` response, parses category-level reserved
-and committed KB into TSV, has a ten-second independent timeout, services the
-HotSpot SIGQUIT attach handshake when the JVM is traced, and re-runs the quiet
-window before freezing. The TSV records runtime, timestamp, collection
-duration, method, unit, and forced-GC state; unavailable runtime version remains
-empty. `--no-jcmd` disables the probe.
+- target PID and stable process identity;
+- runtime name and version when available without another intrusive probe;
+- snapshot timestamp and collection duration;
+- collection method and units;
+- metric scope, such as process, isolate, worker, or runtime-wide;
+- whether the probe forced garbage collection; and
+- an explicit status when data is unavailable.
 
-## Freezer backend
+Unknown values stay absent. An unavailable heap metric is not zero. Raw adapter
+responses should be retained alongside normalized output so a newer parser can
+interpret categories without rerunning the workload.
 
-`--freeze auto` first resolves the target's unified cgroup, requires writable
-freezer controls, and verifies it was not already frozen. For attached targets,
-the cgroup subtree must exactly equal the measured PPID tree. For a launch
-cgroup that the tool verified was initially empty, the same exact-membership
-rule applies after the child joins it. It writes `1` only after those checks,
-waits for `cgroup.events` to report `frozen 1`, and revalidates membership
-before and during capture. Any failed precondition falls back to signals.
+## Timing and perturbation
 
-`--freeze cgroup` turns those failed preconditions into an error. In launch
-mode, `--cgroup PATH` places the child into a caller-provided existing cgroup
-after verifying that the delegated cgroup is writable, thawed, and empty. The
-tool never freezes a shared cgroup and never thaws a cgroup it did not freeze.
-After writing `0`, it waits for `cgroup.events` to confirm `frozen 0`; failure
-is fatal and the owned path is retained in diagnostics rather than silently
-reporting success.
+Runtime introspection runs before the final OS freeze because cooperative tools
+need a responsive target. The collector then waits for the process tree to
+settle again: an attach handshake, parser, JIT activity, or helper allocation
+can change the footprint being measured.
 
-The signal fallback tracks stopped descendants with pidfds where supported, so
-PID reuse cannot redirect the later resume signal. Kernel-reported ptrace exec
-events are consumed separately from genuine application `SIGTRAP` delivery.
+The default capture must not force garbage collection. A forced-GC mode would
+measure a different state and therefore requires an explicit option plus a
+recorded `forced_gc` value.
 
-## Node.js adapter
+## Local protocol for cooperative adapters
 
-Use a small cooperative preload module, enabled explicitly through
-`NODE_OPTIONS=--require=...`, and communicate over an inherited file descriptor
-or a mode-0600 Unix-domain socket. It should return:
-
-- `process.memoryUsage()` for RSS, heap total/used, external memory, and array
-  buffers
-- `v8.getHeapStatistics()` for V8-wide heap limits and usage
-- `v8.getHeapSpaceStatistics()` for individual V8 spaces
-
-V8 heap-space names and ordering can vary, so store them by returned name and
-preserve the Node/V8 versions. In worker-thread applications, several
-`process.memoryUsage()` fields describe only the calling thread; the adapter
-should collect in each worker when possible and label the scope.
-
-The inspector protocol can be a secondary adapter when it is already enabled.
-Do not automatically expose or activate a network inspector merely to capture
-memory: that changes application behavior and expands its attack surface.
-
-## Go adapter
-
-Use a small opt-in package that calls `runtime/metrics.Read` and serves a
-versioned snapshot over an inherited descriptor or Unix-domain socket. Capture
-the supported `/memory/classes/...` and `/gc/heap/...` metrics by name, along
-with the Go version and each metric's kind. The runtime metric set evolves, so
-the collector must discover metrics rather than rely on a fixed positional
-schema.
-
-Heap profiles from `runtime/pprof` or an already-protected `/debug/pprof/heap`
-endpoint are an optional attribution layer, not the default footprint capture.
-There is no stable, general external interface for extracting Go runtime memory
-classes from an arbitrary uninstrumented PID; such a target still receives the
-complete OS-level process-tree report.
-
-## Adapter protocol
-
-Use one local, versioned request for every runtime:
+Node.js and Go adapters should use a local inherited file descriptor or a
+mode-`0600` Unix-domain socket. They should not expose a new network listener.
+A versioned request keeps the collector and runtime package independently
+upgradable:
 
 ```json
 {"version":1,"operation":"memory_snapshot","force_gc":false}
 ```
 
-A response has a common envelope and runtime-owned metrics:
+The response envelope carries runtime-owned metrics without pretending they
+are OS ownership totals:
 
 ```json
 {
@@ -160,16 +98,9 @@ A response has a common envelope and runtime-owned metrics:
 }
 ```
 
-Keep raw adapter responses alongside a normalized JSON result so that new
-runtime categories can be interpreted later without rerunning the workload.
-Adapters should have a short timeout, fail independently, and never prevent the
-OS capture.
+Adapter timeouts are independent. A missing, failed, or timed-out runtime probe
+must not invalidate an otherwise sound kernel footprint.
 
-## Recommended delivery order
-
-1. Add a normalized JSON output containing the existing tree-level OS metrics.
-2. Add the Node preload adapter and a fixture with worker threads and buffers.
-3. Add the Go package/Unix-socket adapter and a fixture that exercises heap,
-   stacks, and goroutine growth.
-4. Add optional high-cost profiles and explicit GC modes only after the low-
-   perturbation snapshots are stable.
+See the [capture model](https://menzew.github.io/memoryfootprint/capture-model/) for where these
+probes occur relative to settling, freezing, working-set boundaries, and
+artifact publication.
