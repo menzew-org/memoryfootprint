@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+
+title: memftprt
+description: Consistent process-tree memory capture for Linux
+url: https://menzew.github.io
+baseurl: /memoryfootprint
+repository: menzew/memoryfootprint
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+exclude:
+  - README.md

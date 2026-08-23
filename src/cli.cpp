@@ -52,6 +52,9 @@ void print_help(FILE* stream, const char* program_name) {
     std::fprintf(stream, "Runtime capture:\n");
     std::fprintf(stream, "      --enable-jvm-nmt     enable HotSpot NMT for a launched JVM\n");
     std::fprintf(stream, "      --no-jcmd            disable automatic JVM NMT collection\n\n");
+    std::fprintf(stream, "Memory detail:\n");
+    std::fprintf(stream, "      --mappings           capture and classify every memory mapping\n");
+    std::fprintf(stream, "      --working-set SEC    measure pages referenced during an interval\n\n");
     std::fprintf(stream, "Output and diagnostics:\n");
     std::fprintf(stream, "  -o, --output-dir DIR     write artifacts to DIR (default: current directory)\n");
     std::fprintf(stream, "  -f, --format FORMAT      tsv, json, html, or all (default: tsv)\n");
@@ -63,6 +66,7 @@ void print_help(FILE* stream, const char* program_name) {
     std::fprintf(stream, "  %s -o captures --format all -- ./server --port 8080\n", program_name);
     std::fprintf(stream, "  %s --pid 1234 --stable-window 5\n", program_name);
     std::fprintf(stream, "  %s --enable-jvm-nmt -- java -jar app.jar\n", program_name);
+    std::fprintf(stream, "  %s --working-set 10 --format all -- ./server\n", program_name);
 }
 
 void print_error(FILE* stream, const char* program_name, const std::string& message) {
@@ -167,6 +171,20 @@ Result parse(int argc, char** argv) {
         } else if (std::strcmp(option, "--enable-jvm-nmt") == 0) {
             config.enable_jvm_nmt = true;
             ++index;
+        } else if (std::strcmp(option, "--mappings") == 0) {
+            config.mappings_enabled = true;
+            ++index;
+        } else if (std::strcmp(option, "--working-set") == 0) {
+            if (++index >= argc) {
+                throw Error("--working-set requires a duration in seconds");
+            }
+            const unsigned long value =
+                static_cast<unsigned long>(parse_positive(argv[index++], "--working-set"));
+            if (value > std::numeric_limits<unsigned>::max()) {
+                throw Error("working-set window is outside the supported range");
+            }
+            config.working_set_seconds = static_cast<unsigned>(value);
+            config.mappings_enabled = true;
         } else {
             throw Error(std::string("unknown option '") + option + "'");
         }

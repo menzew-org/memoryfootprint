@@ -27,10 +27,9 @@ separate job provides ptrace coverage.
   runtime probing, and capture.
 - `src/linux/proc_memory.*` reads Linux `smaps_rollup`/`smaps` accounting.
 
-Platform backends should populate the shared report model rather than adding
-platform conditions to serializers. A Windows backend can therefore replace
-Linux process discovery, quiescence, freezing, and accounting while preserving
-the CLI and output contracts.
+Capture modules populate the shared report model rather than adding
+platform-specific conditions to serializers. This keeps process discovery,
+quiescence, freezing, accounting, and presentation responsibilities separate.
 
 ## Change expectations
 

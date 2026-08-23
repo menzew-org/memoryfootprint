@@ -1,0 +1,50 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#0b3b4a">
+    <meta name="description" content="{{ page.description | default: site.description | escape }}">
+    <title>{{ page.title | default: site.title }} · {{ site.title }}</title>
+    <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="{{ '/' | relative_url }}" aria-label="memftprt documentation home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>memftprt</span>
+        </a>
+        <nav aria-label="Documentation">
+          <a {% if page.url == '/understanding-output/' %}aria-current="page"{% endif %}
+             href="{{ '/understanding-output/' | relative_url }}">Output</a>
+          <a {% if page.url == '/runtime-adapters/' %}aria-current="page"{% endif %}
+             href="{{ '/runtime-adapters/' | relative_url }}">Runtimes</a>
+          <a {% if page.url == '/architecture/' %}aria-current="page"{% endif %}
+             href="{{ '/architecture/' | relative_url }}">Architecture</a>
+          <a class="repo-link" href="https://github.com/menzew/memoryfootprint">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="content" class="page-shell">
+      {% unless page.url == '/' %}
+      <div class="page-heading">
+        <p class="eyebrow">memftprt documentation</p>
+        <p>{{ page.description }}</p>
+      </div>
+      {% endunless %}
+      <article class="prose{% if page.url == '/' %} home{% endif %}">
+        {{ content }}
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>memftprt · Apache-2.0 · Linux process-tree memory capture</p>
+      <a href="https://github.com/menzew/memoryfootprint">Source and releases on GitHub</a>
+    </footer>
+  </body>
+</html>

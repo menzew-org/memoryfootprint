@@ -14,7 +14,7 @@
 
 namespace memftprt::cli {
 
-constexpr const char* VERSION = "1.39-reconstructed";
+constexpr const char* VERSION = "0.1.0";
 
 class Error : public std::runtime_error {
 public:

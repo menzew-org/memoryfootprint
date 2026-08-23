@@ -23,11 +23,46 @@ ArtifactStore::ArtifactStore(std::filesystem::path directory)
 
 ArtifactStore::~ArtifactStore() {
     release_lock();
+    if (directory_fd_ >= 0) close(directory_fd_);
 }
 
 bool ArtifactStore::prepare(std::string* reason) {
+    if (directory_fd_ >= 0) {
+        close(directory_fd_);
+        directory_fd_ = -1;
+    }
     std::error_code error;
-    if (!std::filesystem::exists(directory_, error)) {
+    directory_ = std::filesystem::absolute(directory_, error).lexically_normal();
+    if (error) {
+        *reason = "could not resolve output directory " + directory_.string() + ": " +
+                  error.message();
+        return false;
+    }
+
+    std::size_t created_directory_count = 0;
+    std::filesystem::path existing_ancestor = directory_;
+    while (!std::filesystem::exists(existing_ancestor, error)) {
+        if (error) {
+            *reason = "could not inspect output directory " + existing_ancestor.string() + ": " +
+                      error.message();
+            return false;
+        }
+        ++created_directory_count;
+        const std::filesystem::path parent = existing_ancestor.parent_path();
+        if (parent.empty() || parent == existing_ancestor) {
+            *reason = "could not find an existing parent for output directory " +
+                      directory_.string();
+            return false;
+        }
+        existing_ancestor = parent;
+    }
+    if (error) {
+        *reason = "could not inspect output directory " + existing_ancestor.string() + ": " +
+                  error.message();
+        return false;
+    }
+
+    if (created_directory_count != 0) {
         (void)std::filesystem::create_directories(directory_, error);
         if (error) {
             *reason = "could not create output directory " + directory_.string() + ": " +
@@ -42,6 +77,18 @@ bool ArtifactStore::prepare(std::string* reason) {
     directory_ = std::filesystem::canonical(directory_, error);
     if (error || access(directory_.c_str(), W_OK | X_OK) < 0) {
         *reason = "output directory is not writable: " + directory_.string();
+        return false;
+    }
+    directory_fd_ = open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd_ < 0) {
+        *reason = "could not open output directory " + directory_.string() + ": " +
+                  std::strerror(errno);
+        return false;
+    }
+    if (created_directory_count != 0 &&
+        !sync_created_directory_chain(created_directory_count, reason)) {
+        close(directory_fd_);
+        directory_fd_ = -1;
         return false;
     }
     return true;
@@ -101,6 +148,10 @@ const std::filesystem::path& ArtifactStore::directory() const {
 
 std::size_t ArtifactStore::committed_count() const {
     return committed_artifacts_.size();
+}
+
+const std::vector<std::string>& ArtifactStore::committed_artifacts() const {
+    return committed_artifacts_;
 }
 
 void ArtifactStore::discard_temp(TempFile* temporary) {
@@ -185,6 +236,19 @@ bool ArtifactStore::commit_temp(TempFile* temporary, const std::string& output_n
         return false;
     }
     temporary->path.clear();
+    if (!sync_directory(reason)) {
+        const std::string sync_failure = *reason;
+        if (unlink(output_name.c_str()) < 0) {
+            *reason = sync_failure + "; could not remove unsynced artifact " + output_name +
+                      ": " + std::strerror(errno);
+        } else {
+            std::string cleanup_reason;
+            if (!sync_directory(&cleanup_reason)) {
+                *reason = sync_failure + "; cleanup was also not durable: " + cleanup_reason;
+            }
+        }
+        return false;
+    }
     committed_artifacts_.push_back(output_name);
     return true;
 }
@@ -198,6 +262,64 @@ bool ArtifactStore::write_text(const std::string& output_name, const std::string
         return false;
     }
     return commit_temp(&temporary, output_name, reason);
+}
+
+bool ArtifactStore::remove_file(const std::string& output_name, bool missing_ok,
+                                std::string* reason) {
+    if (unlink(output_name.c_str()) < 0) {
+        if (missing_ok && errno == ENOENT) return true;
+        *reason = "could not remove " + output_name + ": " + std::strerror(errno);
+        return false;
+    }
+    return sync_directory(reason);
+}
+
+bool ArtifactStore::sync_directory(std::string* reason) {
+    if (directory_fd_ < 0) {
+        *reason = "output directory is not prepared";
+        return false;
+    }
+    if (fsync(directory_fd_) < 0) {
+        *reason = "could not fsync output directory " + directory_.string() + ": " +
+                  std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+bool ArtifactStore::sync_created_directory_chain(std::size_t created_directory_count,
+                                                 std::string* reason) {
+    // Persist both each newly created directory inode and the parent entry that
+    // names it. For N created components this means syncing the final directory
+    // and then N ancestors, deepest first.
+    std::filesystem::path current = directory_;
+    for (std::size_t depth = 0; depth <= created_directory_count; ++depth) {
+        int fd = -1;
+        if (depth == 0) {
+            fd = dup(directory_fd_);
+        } else {
+            fd = open(current.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        }
+        if (fd < 0) {
+            *reason = "could not open output-directory durability path " + current.string() +
+                      ": " + std::strerror(errno);
+            return false;
+        }
+        if (fsync(fd) < 0) {
+            const int saved_errno = errno;
+            close(fd);
+            *reason = "could not fsync output-directory durability path " + current.string() +
+                      ": " + std::strerror(saved_errno);
+            return false;
+        }
+        if (close(fd) < 0) {
+            *reason = "could not close output-directory durability path " + current.string() +
+                      ": " + std::strerror(errno);
+            return false;
+        }
+        current = current.parent_path();
+    }
+    return true;
 }
 
 }  // namespace memftprt

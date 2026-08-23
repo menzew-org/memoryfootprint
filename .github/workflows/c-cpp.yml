@@ -12,12 +12,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
+    - uses: actions/checkout@v7
+    - name: Build
       run: make
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+    - name: Prepare delegated cgroup v2
+      run: |
+        sudo mkdir -p /sys/fs/cgroup/memftprt-ci
+        sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/memftprt-ci
+        sudo chown "$(id -u):$(id -g)" \
+          /sys/fs/cgroup/memftprt-ci/cgroup.procs \
+          /sys/fs/cgroup/memftprt-ci/cgroup.freeze
+    - name: Test
+      env:
+        MEMFTPRT_TEST_CGROUP: /sys/fs/cgroup/memftprt-ci
+        MEMFTPRT_REQUIRE_CGROUP_TEST: "1"
+      run: make test
+    - name: Clean up delegated cgroup
+      if: always()
+      run: sudo rmdir /sys/fs/cgroup/memftprt-ci || true

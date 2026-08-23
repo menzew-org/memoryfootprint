@@ -5,17 +5,23 @@ It waits for an application to settle, optionally collects HotSpot JVM Native
 Memory Tracking data, freezes the complete application tree, and writes both a
 readable summary and TSV, JSON, or self-contained HTML reports.
 
-The maintained code is a C++17 reconstruction of the useful behavior of
-`memftprt` 1.39, extended with modern Linux process-tree accounting,
-quiescence detection, runtime-aware capture, and defensive cleanup.
+The maintained C++17 implementation combines Linux process-tree accounting,
+quiescence detection, runtime-aware capture, and defensive lifecycle cleanup.
+
+Read the hosted documentation at
+[menzew.github.io/memoryfootprint](https://menzew.github.io/memoryfootprint/).
 
 ## What it measures
 
 - the root process and all discoverable descendants;
 - virtual size, RSS, PSS, USS, anonymous/file/shared memory, and swap;
+- optional per-mapping categories, huge-page use, locked memory, and kernel
+  reference state;
+- optional referenced-working-set estimates over a controlled observation
+  window;
 - one per-process row plus a process-tree `TOTAL` row;
-- the root process's legacy `status`, `stat`, `statm`, `ps`, `top`, and maps
-  views for compatibility; and
+- additional root-process `status`, `stat`, `statm`, `ps`, `top`, and maps
+  views for operator context; and
 - HotSpot JVM Native Memory Tracking categories when available.
 
 PSS is normally the best single number for the physical memory owned by a
@@ -28,6 +34,8 @@ the OS totals with JVM heap or NMT values.
 - Linux with `/proc`
 - GNU Make and a C++17 compiler
 - permission to trace the target process
+- permission to read full `smaps`, and to write `clear_refs` when using
+  `--working-set`
 - optional: `jcmd` for HotSpot JVM Native Memory Tracking
 - optional: a delegated cgroup v2 for cgroup freezing
 
@@ -104,6 +112,40 @@ Attaching cannot enable NMT retroactively. If it was not enabled, metadata says
 
 More copy-and-paste recipes are in [examples/](examples/README.md).
 
+### 5. Explain the address space
+
+~~~sh
+./build/memftprt --mappings --format all --output-dir captures -- ./server
+~~~
+
+This reads full smaps while the tree is frozen and classifies mappings such
+as the main executable, shared libraries, heap, stacks, shared memory, deleted
+files, and executable anonymous memory. The last category often includes JIT
+code, but it is intentionally not attributed to a specific runtime without
+runtime evidence. A detailed read is rejected if any VMA lacks complete RSS/PSS
+accounting, if one process exceeds 100,000 mappings or 128 MiB of smaps input,
+or if the whole frozen tree exceeds 200,000 mappings or 256 MiB. Interrupts are
+checked while smaps is parsed so cleanup does not wait for the remaining tree.
+
+### 6. Estimate the referenced working set
+
+~~~sh
+./build/memftprt --working-set 10 --format all --output-dir captures -- ./server
+~~~
+
+After the application settles, the tool freezes the exact tree, clears Linux
+page-reference state, lets the application run for ten seconds, then freezes
+and reads it again. The --working-set option implies --mappings. The capture
+fails if process identities or mapping topology differ between those two frozen
+boundaries. Churn that begins and ends entirely inside the running interval is
+not observable from endpoint snapshots and is disclosed as
+`validation_scope=boundary_snapshots`.
+
+`clear_refs` deliberately resets kernel reference state for the target. This
+changes what other reference-bit diagnostics observe and may influence kernel
+page-aging decisions, so use working-set mode only when that perturbation is
+acceptable.
+
 ## Common options
 
 | Option | Purpose |
@@ -118,6 +160,8 @@ More copy-and-paste recipes are in [examples/](examples/README.md).
 | `--cgroup PATH` | Launch into an empty delegated cgroup v2 |
 | `--enable-jvm-nmt` | Enable NMT for a JVM launched by the tool |
 | `--no-jcmd` | Disable automatic JVM probing |
+| `--mappings` | Capture and classify every mapping from full smaps |
+| `--working-set SEC` | Estimate pages referenced during an observation window |
 | `--quiet` | Suppress successful-run output; artifacts are still written |
 | `-v, --verbose` | Show capture decisions; repeat for more detail |
 
@@ -140,6 +184,13 @@ The tree must remain stable for the configured window. At the timeout,
 Fixed-delay mode bypasses quiescence detection but still freezes the tree before
 reading memory.
 
+Working-set mode adds a second freeze. Runtime probes run before reference
+state is cleared, so jcmd activity is excluded from the observation window.
+The same freeze backend must be used at both boundaries, and PID/start-time and
+mapping identities must match exactly at those boundaries. This check detects
+persistent churn but cannot prove that no short-lived child or mapping existed
+and disappeared between snapshots.
+
 `--freeze auto` uses cgroup v2 only when its controls are writable and its
 membership exactly equals the application tree. Membership is revalidated
 after freezing and during capture. Otherwise it uses a ptrace/SIGSTOP fallback
@@ -153,18 +204,43 @@ cgroup has thawed before reporting success.
 | `process_tree_memory_PID.tsv` | Per-process memory and aggregate `TOTAL` row |
 | `memory_report_PID.json` | Versioned machine-readable capture, process rows, and totals |
 | `memory_report_PID.html` | Self-contained browser report with interpretation guidance |
+| `memory_mappings_PID.tsv` | One row per mapping when --mappings is enabled |
+| `memory_mapping_categories_PID.tsv` | Tree-wide mapping-category totals |
 | `capture_metadata_PID.tsv` | Freeze backend, cgroup, launcher, and runtime status |
-| `proccess_maps_PID.txt` | `/proc/PID/maps`; legacy misspelling retained |
-| `process_ps_PID.txt` | Root-process `ps` snapshot |
-| `process_top_PID.txt` | Root-process `top` snapshot |
+| `capture_complete_PID.tsv` | Final bundle-completion marker and payload artifact list |
+| `proccess_maps_PID.txt` | Best-effort `/proc/PID/maps`; filename spelling is part of the artifact contract |
+| `process_ps_PID.txt` | Best-effort root-process `ps` snapshot |
+| `process_top_PID.txt` | Best-effort root-process `top` snapshot |
 | `jvm_nmt_PID.txt` | Raw HotSpot NMT response, when detected |
 | `jvm_nmt_PID.tsv` | Normalized NMT categories, when parsing succeeds |
 
 Artifacts are mode `0600`. They stay on descriptor-backed randomized temporary
-files through write and `fsync`, then are atomically renamed. A per-target lock
-prevents concurrent collectors from writing the same PID-based result set.
-Capture metadata and diagnostic snapshots are written regardless of primary
-report format because they explain how the measurement was obtained.
+files through write and `fsync`, then are atomically renamed and followed by an
+output-directory `fsync`. When the output directory is newly created, each new
+directory entry is also synchronized through its existing ancestor. A
+per-target lock prevents concurrent collectors from writing the same PID-based
+result set.
+
+Capture metadata is written regardless of primary report format because it
+explains how the measurement was obtained. Diagnostic snapshots are attempted
+for every format, but missing or failing `cat`, `ps`, or `top` commands do not
+invalidate the primary memory capture; metadata records each snapshot as
+`captured` or `unavailable`.
+
+Each file is atomic, but a multi-file capture is not one filesystem transaction.
+At capture start, memftprt removes any prior completion marker for that PID and
+durably records that removal. It resumes or releases the target, publishes every
+requested report, then writes `capture_complete_PID.tsv` last. Automation
+should treat a bundle as valid only when that marker exists and should use its
+artifact list rather than directory globs that may include files from an older
+capture.
+
+Linux process names and mapping paths are byte sequences rather than guaranteed
+UTF-8. Serializers preserve valid UTF-8 and replace malformed sequences with
+the Unicode replacement character so JSON, HTML, and TSV remain decodable.
+
+JSON and HTML keep mapping detail in the main report. TSV uses separate mapping
+and category tables so the existing process table remains easy to consume.
 
 ## Exit behavior
 
@@ -175,7 +251,9 @@ report format because they explain how the measurement was obtained.
 - `254` or `255`: runtime capture or internal invariant failure
 
 Termination signals follow the same thaw/resume path before exit. If a cgroup
-cannot be confirmed thawed, the diagnostic includes its path for recovery.
+cannot be confirmed thawed, the diagnostic includes its path for recovery. An
+interrupted capture never publishes a completion marker; individually atomic
+payload files may remain if interruption occurred during publication.
 
 ## Tests
 
@@ -183,10 +261,11 @@ cannot be confirmed thawed, the diagnostic includes its path for recovery.
 make test
 ```
 
-The suite covers CLI behavior, output directories, quiet mode, fixed-delay and
-quiescent capture, attach mode, exec events, signals, external stops, zombies,
-reparented descendants, launcher handoff, JVM NMT, secure artifacts, and
-cleanup.
+The suite covers CLI behavior, nested output directories, quiet mode,
+fixed-delay and quiescent capture, attach mode, exec events, signals, external
+stops, zombies, reparented descendants, launcher handoff, JVM NMT, secure
+artifacts, missing diagnostic utilities, interruption during waits, smaps, and
+jcmd, completion-marker suppression, and cleanup.
 
 Successful cgroup freezing requires a delegated cgroup:
 
@@ -197,6 +276,8 @@ MEMFTPRT_TEST_CGROUP=/sys/fs/cgroup/my-test make test
 Set `MEMFTPRT_REQUIRE_CGROUP_TEST=1` in CI to require that path. If a nested
 environment denies ptrace, the suite exits `77`; use
 `MEMFTPRT_ALLOW_PTRACE_SKIP=1` only when another job provides ptrace coverage.
+The GitHub Actions workflow provisions a delegated cgroup and requires this
+integration test rather than silently skipping it.
 
 ## Further reading
 

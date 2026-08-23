@@ -33,6 +33,8 @@ struct CaptureConfig {
     FreezeMode freeze_mode = FreezeMode::automatic;
     bool jcmd_enabled = true;
     bool enable_jvm_nmt = false;
+    bool mappings_enabled = false;
+    unsigned working_set_seconds = 0;
     std::string launch_cgroup;
     std::filesystem::path output_directory = ".";
     ReportFormat report_format = ReportFormat::tsv;

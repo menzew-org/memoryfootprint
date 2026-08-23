@@ -15,11 +15,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -43,7 +45,9 @@
 #include "../cli.h"
 #include "../memory_report.h"
 #include "../runtime/hotspot_nmt.h"
+#include "cgroup_utils.h"
 #include "proc_memory.h"
+#include "working_set.h"
 
 using ulong_t = unsigned long;
 
@@ -102,6 +106,19 @@ constexpr unsigned short FP_STOPPING = 0x04;
 constexpr unsigned short FP_STOPPED = 0x40;
 constexpr unsigned short FP_LIVE = FP_CREATED | FP_GRABBED;
 
+enum class WaitOutcome {
+    elapsed,
+    interrupted,
+    external_stop,
+};
+
+class CaptureInterrupted final : public std::exception {
+public:
+    const char* what() const noexcept override {
+        return "capture interrupted";
+    }
+};
+
 int debug_level = 0;
 const char* program_name = "memftprt";
 fp_prochandle* target_process = nullptr;
@@ -132,6 +149,8 @@ FreezeMode requested_freeze_mode = FreezeMode::automatic;
 ReportFormat requested_report_format = ReportFormat::tsv;
 bool jcmd_enabled = true;
 bool enable_jvm_nmt = false;
+bool mappings_enabled = false;
+unsigned working_set_seconds = 0;
 std::string selected_freeze_backend = "none";
 std::string selected_cgroup_path;
 std::string requested_launch_cgroup;
@@ -146,6 +165,20 @@ struct runtime_capture_metadata {
     bool forced_gc = false;
 };
 std::map<pid_t, runtime_capture_metadata> jvm_capture_status;
+std::map<std::string, std::string> snapshot_capture_status;
+std::map<pid_t, std::string> captured_smaps_sources;
+std::optional<WorkingSetInfo> captured_working_set;
+unsigned pidfd_successes = 0;
+unsigned pidfd_failures = 0;
+
+struct working_set_capture_state {
+    std::map<pid_t, unsigned long> process_identities;
+    std::map<pid_t, std::set<linux_working_set::MappingIdentity>> mapping_identities;
+    WorkingSetInfo info;
+    std::chrono::steady_clock::time_point started_monotonic;
+    std::string freeze_backend;
+    std::string cgroup_path;
+};
 
 void release_process(fp_prochandle* fp_proc);
 int kill_process(fp_prochandle* fp_proc);
@@ -265,10 +298,36 @@ std::string output_path(const std::string& filename) {
 void acquire_output_lock(pid_t root_pid) {
     std::string reason;
     if (!artifact_store->acquire_lock(root_pid, &reason)) abend("%s\n", reason.c_str());
+
+    // A marker from an earlier capture of a reused PID must stop advertising
+    // the bundle as complete before this collector replaces any artifacts.
+    const std::string marker = output_path("capture_complete_" +
+                                           std::to_string(root_pid) + ".tsv");
+    if (!artifact_store->remove_file(marker, true, &reason)) abend("%s\n", reason.c_str());
 }
 
 void release_output_lock() {
     if (artifact_store != nullptr) artifact_store->release_lock();
+}
+
+void cleanup_capture_target() {
+    (void)thaw_cgroup();
+    (void)resume_stopped_descendants();
+    if (target_process != nullptr) {
+        if (kill_before_exit) {
+            kill_process(target_process);
+        } else {
+            release_process(target_process);
+        }
+        target_process = nullptr;
+    }
+    release_output_lock();
+}
+
+bool abandon_interrupted_capture() {
+    if (exiting == 0) return false;
+    cleanup_capture_target();
+    return true;
 }
 
 using secure_temp_file = ArtifactStore::TempFile;
@@ -529,7 +588,7 @@ int kill_process(fp_prochandle* fp_proc) {
     return 0;
 }
 
-void continue_until_elapsed(fp_prochandle* fp_proc, unsigned seconds) {
+WaitOutcome continue_until_elapsed(fp_prochandle* fp_proc, unsigned seconds) {
     fp_assert(fp_proc != nullptr, "fp_proc is NULL");
     fp_assert(fp_proc->pid != getpid(), "invoked on self");
     d_printf(3, "continue_until_elapsed: calling wait_on_target:  wait time = %u\n", seconds);
@@ -576,10 +635,10 @@ void continue_until_elapsed(fp_prochandle* fp_proc, unsigned seconds) {
                     fp_proc->flags &= static_cast<unsigned short>(~FP_STOPPING);
                     fp_proc->cursig = 0;
                     d_printf(4, "wait_on_target: the wait is over!\n");
-                    return;
+                    return exiting == 0 ? WaitOutcome::elapsed : WaitOutcome::interrupted;
                 }
                 if (!resume_after_target_stop(fp_proc)) {
-                    return;
+                    return WaitOutcome::external_stop;
                 }
             }
         }
@@ -905,7 +964,7 @@ unsigned long absolute_difference(long left, long right) {
     return static_cast<unsigned long>(left >= right ? left - right : right - left);
 }
 
-void continue_until_quiescent(fp_prochandle* fp_proc) {
+WaitOutcome continue_until_quiescent(fp_prochandle* fp_proc) {
     fp_assert(fp_proc != nullptr, "fp_proc is NULL");
     fp_assert(fp_proc->pid != getpid(), "invoked on self");
 
@@ -923,6 +982,7 @@ void continue_until_quiescent(fp_prochandle* fp_proc) {
     bool have_previous = false;
     bool stability_window_started = false;
     bool stop_requested = false;
+    WaitOutcome stop_outcome = WaitOutcome::elapsed;
     process_sample previous {};
 
     d_printf(1,
@@ -970,10 +1030,10 @@ void continue_until_quiescent(fp_prochandle* fp_proc) {
                     fp_proc->flags &= static_cast<unsigned short>(~FP_STOPPING);
                     fp_proc->cursig = 0;
                     d_printf(1, "target stopped; capturing footprint\n");
-                    return;
+                    return stop_outcome;
                 }
                 if (!resume_after_target_stop(fp_proc)) {
-                    return;
+                    return WaitOutcome::external_stop;
                 }
             }
         }
@@ -1031,7 +1091,8 @@ void continue_until_quiescent(fp_prochandle* fp_proc) {
             stop_requested = true;
         }
         if (!stop_requested && exiting != 0) {
-            d_printf(1, "interrupt received; capturing current state\n");
+            d_printf(1, "interrupt received; stopping target for cleanup\n");
+            stop_outcome = WaitOutcome::interrupted;
             stop_requested = true;
         }
         if (stop_requested && (fp_proc->flags & FP_STOPPING) == 0) {
@@ -1119,46 +1180,9 @@ bool read_unified_cgroup_path(pid_t pid, std::string* cgroup_path, std::string* 
     return false;
 }
 
-bool add_cgroup_processes(const std::filesystem::path& directory, std::set<pid_t>* members) {
-    std::ifstream processes(directory / "cgroup.procs");
-    long value = 0;
-    while (processes >> value) {
-        if (value > 0 && value <= std::numeric_limits<pid_t>::max()) {
-            members->insert(static_cast<pid_t>(value));
-        }
-    }
-    return processes.eof();
-}
-
 bool read_cgroup_subtree_processes(const std::string& cgroup_path, std::set<pid_t>* members,
                                    std::string* reason) {
-    members->clear();
-    if (!add_cgroup_processes(cgroup_path, members)) {
-        *reason = "could not read " + cgroup_path + "/cgroup.procs";
-        return false;
-    }
-    std::error_code error;
-    std::filesystem::recursive_directory_iterator iterator(
-        cgroup_path, std::filesystem::directory_options::skip_permission_denied, error);
-    const std::filesystem::recursive_directory_iterator end;
-    if (error) {
-        *reason = "could not enumerate the target cgroup subtree: " + error.message();
-        return false;
-    }
-    while (iterator != end) {
-        if (iterator->is_directory(error) && !error &&
-            !add_cgroup_processes(iterator->path(), members)) {
-            *reason = "could not read " + (iterator->path() / "cgroup.procs").string();
-            return false;
-        }
-        error.clear();
-        iterator.increment(error);
-        if (error) {
-            *reason = "could not enumerate the target cgroup subtree: " + error.message();
-            return false;
-        }
-    }
-    return true;
+    return linux_cgroup::read_subtree_processes(cgroup_path, members, reason);
 }
 
 bool validate_launch_cgroup(const std::string& supplied_path, std::string* resolved_path,
@@ -1388,6 +1412,11 @@ std::set<pid_t> freeze_process_tree(pid_t root_pid) {
                 continue;
             }
             const int pidfd = open_process_pidfd(pid);
+            if (pidfd >= 0) {
+                ++pidfd_successes;
+            } else {
+                ++pidfd_failures;
+            }
             stopped_process process {pid, start_time, pidfd};
             if (signal_stopped_process(process, SIGSTOP) < 0) {
                 const int saved_errno = errno;
@@ -1452,46 +1481,104 @@ OptionalKb optional_kb(unsigned long value, bool available) {
     return OptionalKb {value, available};
 }
 
+void populate_memory_values(MemoryValues* result, const SmapsMetrics& memory) {
+    result->vsize_kb = memory.size_kb;
+    result->rss_kb = optional_kb(memory.rss_kb, memory.rss_available);
+    result->pss_kb = optional_kb(memory.pss_kb, memory.pss_available);
+    result->uss_kb = optional_kb(linux_procfs::uss_kb(memory),
+                                 linux_procfs::uss_available(memory));
+    result->pss_anon_kb = optional_kb(memory.pss_anon_kb, memory.pss_anon_available);
+    result->pss_file_kb = optional_kb(memory.pss_file_kb, memory.pss_file_available);
+    result->pss_shmem_kb = optional_kb(memory.pss_shmem_kb, memory.pss_shmem_available);
+    result->shared_clean_kb =
+        optional_kb(memory.shared_clean_kb, memory.shared_clean_available);
+    result->shared_dirty_kb =
+        optional_kb(memory.shared_dirty_kb, memory.shared_dirty_available);
+    result->private_clean_kb =
+        optional_kb(memory.private_clean_kb, memory.private_clean_available);
+    result->private_dirty_kb =
+        optional_kb(memory.private_dirty_kb, memory.private_dirty_available);
+    result->anonymous_kb = optional_kb(memory.anonymous_kb, memory.anonymous_available);
+    result->referenced_kb = optional_kb(memory.referenced_kb, memory.referenced_available);
+    result->lazy_free_kb = optional_kb(memory.lazy_free_kb, memory.lazy_free_available);
+    result->locked_kb = optional_kb(memory.locked_kb, memory.locked_available);
+    result->anon_huge_pages_kb =
+        optional_kb(memory.anon_huge_pages_kb, memory.anon_huge_pages_available);
+    result->shmem_pmd_mapped_kb =
+        optional_kb(memory.shmem_pmd_mapped_kb, memory.shmem_pmd_mapped_available);
+    result->file_pmd_mapped_kb =
+        optional_kb(memory.file_pmd_mapped_kb, memory.file_pmd_mapped_available);
+    result->shared_hugetlb_kb =
+        optional_kb(memory.shared_hugetlb_kb, memory.shared_hugetlb_available);
+    result->private_hugetlb_kb =
+        optional_kb(memory.private_hugetlb_kb, memory.private_hugetlb_available);
+    result->swap_kb = optional_kb(memory.swap_kb, memory.swap_available);
+    result->swap_pss_kb = optional_kb(memory.swap_pss_kb, memory.swap_pss_available);
+}
+
 ProcessMemory make_process_memory(pid_t pid, pid_t parent, const std::string& command,
                                   const SmapsMetrics& memory) {
     ProcessMemory result;
     result.pid = pid;
     result.ppid = parent;
     result.command = command;
-    result.vsize_kb = memory.size_kb;
-    result.rss_kb = optional_kb(memory.rss_kb, memory.rss_available);
-    result.pss_kb = optional_kb(memory.pss_kb, memory.pss_available);
-    result.uss_kb = optional_kb(memory.private_clean_kb + memory.private_dirty_kb +
-                                    memory.private_hugetlb_kb,
-                                linux_procfs::uss_available(memory));
-    result.pss_anon_kb = optional_kb(memory.pss_anon_kb, memory.pss_anon_available);
-    result.pss_file_kb = optional_kb(memory.pss_file_kb, memory.pss_file_available);
-    result.pss_shmem_kb = optional_kb(memory.pss_shmem_kb, memory.pss_shmem_available);
-    result.shared_clean_kb =
-        optional_kb(memory.shared_clean_kb, memory.shared_clean_available);
-    result.shared_dirty_kb =
-        optional_kb(memory.shared_dirty_kb, memory.shared_dirty_available);
-    result.private_clean_kb =
-        optional_kb(memory.private_clean_kb, memory.private_clean_available);
-    result.private_dirty_kb =
-        optional_kb(memory.private_dirty_kb, memory.private_dirty_available);
-    result.swap_kb = optional_kb(memory.swap_kb, memory.swap_available);
-    result.swap_pss_kb = optional_kb(memory.swap_pss_kb, memory.swap_pss_available);
+    populate_memory_values(&result, memory);
     return result;
 }
 
-std::string sanitize_tsv(std::string value) {
-    for (char& character : value) {
-        if (character == '\t' || character == '\n' || character == '\r') {
-            character = ' ';
-        }
-    }
-    return value;
+MemoryMapping make_memory_mapping(pid_t pid, const linux_procfs::SmapsMapping& mapping,
+                                  const std::string& category) {
+    MemoryMapping result;
+    result.pid = pid;
+    result.start_address = mapping.start_address;
+    result.end_address = mapping.end_address;
+    result.offset = mapping.offset;
+    result.inode = mapping.inode;
+    result.permissions = mapping.permissions;
+    result.device = mapping.device;
+    result.pathname = mapping.pathname;
+    result.category = category;
+    result.kernel_page_size_kb =
+        optional_kb(mapping.kernel_page_size_kb, mapping.kernel_page_size_available);
+    result.mmu_page_size_kb =
+        optional_kb(mapping.mmu_page_size_kb, mapping.mmu_page_size_available);
+    result.thp_eligible = OptionalBool {mapping.thp_eligible, mapping.thp_eligible_available};
+    result.vm_flags = mapping.vm_flags;
+    populate_memory_values(&result, mapping.memory);
+    return result;
 }
 
-void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
+std::string executable_path(pid_t pid) {
+    char path[4096];
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    const ssize_t length = readlink(link.c_str(), path, sizeof(path) - 1);
+    if (length < 0) return {};
+    path[length] = '\0';
+    return path;
+}
+
+std::string pidfd_capture_status() {
+    if (selected_freeze_backend != "signals" || pidfd_successes + pidfd_failures == 0) {
+        return "not_applicable";
+    }
+    if (pidfd_failures == 0) return "used";
+    if (pidfd_successes != 0) return "partial";
+    return "unavailable";
+}
+
+MemoryReport build_process_tree_memory_report(
+    pid_t root_pid, const std::set<pid_t>& tree, unsigned long long snapshot_timestamp_ns,
+    const std::map<pid_t, linux_procfs::SmapsDetail>* supplied_details = nullptr) {
     std::vector<process_memory_record> records;
+    std::vector<MemoryMapping> mapping_rows;
+    struct category_accumulator {
+        std::size_t count = 0;
+        SmapsMetrics memory;
+    };
+    std::map<std::string, category_accumulator> category_totals;
     SmapsMetrics total;
+    linux_procfs::SmapsReadBudget detailed_budget;
+    captured_smaps_sources.clear();
     for (pid_t pid : tree) {
         std::vector<std::string> fields;
         std::string command;
@@ -1508,8 +1595,41 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
                                  : 0;
         SmapsMetrics memory;
         std::string memory_reason;
-        if (!linux_procfs::read_smaps_metrics(pid, &memory, &memory_reason)) {
-            abend("%s\n", memory_reason.c_str());
+        linux_procfs::SmapsDetail detail;
+        if (mappings_enabled) {
+            const linux_procfs::SmapsDetail* detail_source = &detail;
+            if (supplied_details != nullptr) {
+                const auto found = supplied_details->find(pid);
+                if (found == supplied_details->end()) {
+                    abend("missing frozen smaps detail for process %d\n", pid);
+                }
+                detail_source = &found->second;
+            } else if (!linux_procfs::read_smaps_detail(
+                           pid, &detail, &memory_reason, &detailed_budget,
+                           []() { return exiting != 0; })) {
+                if (exiting != 0) throw CaptureInterrupted {};
+                abend("%s\n", memory_reason.c_str());
+            }
+            memory = detail_source->total;
+            captured_smaps_sources[pid] = detail_source->process_totals_from_rollup
+                                               ? "smaps+smaps_rollup"
+                                               : "smaps";
+            const std::string executable = executable_path(pid);
+            for (const linux_procfs::SmapsMapping& mapping : detail_source->mappings) {
+                const std::string category_name =
+                    linux_procfs::classify_mapping(mapping, executable);
+                category_accumulator& category = category_totals[category_name];
+                linux_procfs::merge_smaps_metrics(&category.memory, mapping.memory,
+                                                  category.count == 0);
+                ++category.count;
+                mapping_rows.push_back(make_memory_mapping(pid, mapping, category_name));
+            }
+        } else {
+            std::string source;
+            if (!linux_procfs::read_smaps_metrics(pid, &memory, &memory_reason, &source)) {
+                abend("%s\n", memory_reason.c_str());
+            }
+            captured_smaps_sources[pid] = source;
         }
         // smaps_rollup does not expose Size on every supported kernel; stat's
         // vsize is the authoritative process-wide virtual address size.
@@ -1543,12 +1663,17 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
     MemoryReport report;
     report.root_pid = root_pid;
     report.launcher_pid = original_launcher_pid;
-    report.timestamp_ns = static_cast<unsigned long long>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    report.timestamp_ns = snapshot_timestamp_ns;
     report.freeze_backend = selected_freeze_backend;
     report.cgroup_path = selected_cgroup_path;
+    report.pidfd_status = pidfd_capture_status();
+    report.reference_scope = captured_working_set.has_value() ? "since_clear_refs"
+                                                              : "kernel_current";
+    report.mappings_captured = mappings_enabled;
+    for (const auto& source : captured_smaps_sources) {
+        report.smaps_sources[source.first] = source.second;
+    }
+    report.working_set = captured_working_set;
     for (const auto& capture : jvm_capture_status) {
         report.runtime_status[capture.first] = capture.second.status;
     }
@@ -1557,7 +1682,35 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
             make_process_memory(record.pid, record.parent, record.command, record.memory));
     }
     report.total = make_process_memory(0, 0, std::to_string(records.size()) + " processes", total);
+    report.mappings = std::move(mapping_rows);
+    std::sort(report.mappings.begin(), report.mappings.end(),
+              [](const MemoryMapping& left, const MemoryMapping& right) {
+                  const unsigned long left_pss = left.pss_kb.available ? left.pss_kb.value : 0;
+                  const unsigned long right_pss = right.pss_kb.available ? right.pss_kb.value : 0;
+                  if (left_pss != right_pss) return left_pss > right_pss;
+                  if (left.pid != right.pid) return left.pid < right.pid;
+                  return left.start_address < right.start_address;
+              });
+    for (const auto& category : category_totals) {
+        MappingCategory row;
+        row.category = category.first;
+        row.mapping_count = category.second.count;
+        populate_memory_values(&row, category.second.memory);
+        report.mapping_categories.push_back(row);
+    }
+    std::sort(report.mapping_categories.begin(), report.mapping_categories.end(),
+              [](const MappingCategory& left, const MappingCategory& right) {
+                  const unsigned long left_pss = left.pss_kb.available ? left.pss_kb.value : 0;
+                  const unsigned long right_pss = right.pss_kb.available ? right.pss_kb.value : 0;
+                  if (left_pss != right_pss) return left_pss > right_pss;
+                  return left.category < right.category;
+              });
 
+    return report;
+}
+
+void write_memory_reports(const MemoryReport& report) {
+    const pid_t root_pid = static_cast<pid_t>(report.root_pid);
     const auto write_report = [&](const std::string& filename, const std::string& contents) {
         std::string reason;
         if (!write_atomic_text(output_path(filename), contents, &reason)) {
@@ -1568,6 +1721,12 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
         requested_report_format == ReportFormat::all) {
         write_report("process_tree_memory_" + std::to_string(root_pid) + ".tsv",
                      render_tsv(report));
+        if (mappings_enabled) {
+            write_report("memory_mappings_" + std::to_string(root_pid) + ".tsv",
+                         render_mappings_tsv(report));
+            write_report("memory_mapping_categories_" + std::to_string(root_pid) + ".tsv",
+                         render_mapping_categories_tsv(report));
+        }
     }
     if (requested_report_format == ReportFormat::json ||
         requested_report_format == ReportFormat::all) {
@@ -1581,18 +1740,22 @@ void collect_process_tree_memory(pid_t root_pid, const std::set<pid_t>& tree) {
     }
 }
 
-void run_snapshot_command(const std::string& executable, const std::vector<std::string>& arguments,
+bool run_snapshot_command(const std::string& executable,
+                          const std::vector<std::string>& arguments,
                           const std::string& output_name) {
     secure_temp_file temporary;
     std::string reason;
     if (!create_secure_temp(output_name, &temporary, &reason)) {
-        abend("%s\n", reason.c_str());
+        std::fprintf(stderr, "%s: warning - optional snapshot %s unavailable: %s\n",
+                     program_name, executable.c_str(), reason.c_str());
+        return false;
     }
     const pid_t child = fork();
     if (child < 0) {
         discard_secure_temp(&temporary);
-        abend("could not fork snapshot command %s: %s\n", executable.c_str(),
-              std::strerror(errno));
+        std::fprintf(stderr, "%s: warning - could not fork optional snapshot %s: %s\n",
+                     program_name, executable.c_str(), std::strerror(errno));
+        return false;
     }
     if (child == 0) {
         if (dup2(temporary.fd, STDOUT_FILENO) < 0 || dup2(temporary.fd, STDERR_FILENO) < 0) {
@@ -1605,25 +1768,56 @@ void run_snapshot_command(const std::string& executable, const std::vector<std::
             argv.push_back(const_cast<char*>(argument.c_str()));
         }
         argv.push_back(nullptr);
-        execv(executable.c_str(), argv.data());
+        execvp(executable.c_str(), argv.data());
         dprintf(STDERR_FILENO, "exec %s failed: %s\n", executable.c_str(),
                 std::strerror(errno));
         _exit(127);
     }
     int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        discard_secure_temp(&temporary);
-        abend("waitpid failed for snapshot command %s: %s\n", executable.c_str(),
-              std::strerror(errno));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        if (exiting != 0) {
+            (void)::kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            discard_secure_temp(&temporary);
+            throw CaptureInterrupted {};
+        }
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 && errno != EINTR) {
+            const int saved_errno = errno;
+            (void)::kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            discard_secure_temp(&temporary);
+            std::fprintf(stderr, "%s: warning - optional snapshot %s wait failed: %s\n",
+                         program_name, executable.c_str(), std::strerror(saved_errno));
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void)::kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            discard_secure_temp(&temporary);
+            std::fprintf(stderr, "%s: warning - optional snapshot %s timed out\n",
+                         program_name, executable.c_str());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         discard_secure_temp(&temporary);
-        abend("snapshot command %s failed with status %d\n", executable.c_str(), status);
+        std::fprintf(stderr, "%s: warning - optional snapshot %s failed with status %d\n",
+                     program_name, executable.c_str(), status);
+        return false;
     }
     if (!commit_secure_temp(&temporary, output_name, &reason)) {
-        abend("%s\n", reason.c_str());
+        std::fprintf(stderr, "%s: warning - optional snapshot %s was not committed: %s\n",
+                     program_name, executable.c_str(), reason.c_str());
+        return false;
     }
+    return true;
 }
 
 bool process_is_hotspot(pid_t pid) {
@@ -1653,6 +1847,7 @@ bool process_is_hotspot(pid_t pid) {
 struct command_capture_result {
     int status = -1;
     bool timed_out = false;
+    bool interrupted = false;
     bool output_ready = false;
 };
 
@@ -1718,6 +1913,14 @@ command_capture_result run_jcmd_capture(fp_prochandle* fp_proc, pid_t pid,
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
         int status = 0;
+        if (exiting != 0) {
+            result.interrupted = true;
+            (void)::kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+            }
+            result.status = status;
+            return abandon();
+        }
         if (!service_traced_target_during_probe(fp_proc)) {
             (void)::kill(child, SIGKILL);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
@@ -1761,10 +1964,11 @@ std::size_t write_nmt_tsv(pid_t pid, const std::string& raw_output,
         hotspot_nmt::parse_summary(raw_output);
     for (const hotspot_nmt::Category& category : categories) {
         output << pid << '\t' << metadata.runtime << '\t'
-               << sanitize_tsv(metadata.runtime_version) << '\t' << metadata.timestamp_ns << '\t'
-               << metadata.duration_ns << '\t' << sanitize_tsv(metadata.method) << '\t'
+               << sanitize_tsv_field(metadata.runtime_version) << '\t' << metadata.timestamp_ns
+               << '\t' << metadata.duration_ns << '\t' << sanitize_tsv_field(metadata.method)
+               << '\t'
                << (metadata.forced_gc ? "true" : "false") << '\t'
-               << sanitize_tsv(category.name) << '\t' << category.reserved_kb << '\t'
+               << sanitize_tsv_field(category.name) << '\t' << category.reserved_kb << '\t'
                << category.committed_kb << '\t' << metadata.units << '\n';
     }
     if (!write_atomic_text(output_name, output.str(), &reason)) {
@@ -1800,6 +2004,11 @@ void capture_jvm_nmt(fp_prochandle* fp_proc, pid_t pid, unsigned long expected_s
             std::chrono::steady_clock::now() - started)
             .count());
     const std::string output = result.output_ready ? read_text_file(raw_name) : std::string {};
+    if (result.interrupted) {
+        metadata.status = "interrupted";
+        jvm_capture_status[pid] = metadata;
+        return;
+    }
     if (result.timed_out) {
         metadata.status = "timeout";
         jvm_capture_status[pid] = metadata;
@@ -1868,6 +2077,7 @@ bool capture_runtime_snapshots(fp_prochandle* fp_proc) {
     for (int pass = 0; pass < 2; ++pass) {
         const auto current_jvms = pass == 0 ? jvms : discover_jvms();
         for (const auto& identity : current_jvms) {
+            if (exiting != 0) return true;
             if (!attempted.insert(identity).second) continue;
             capture_jvm_nmt(fp_proc, identity.first, identity.second);
             reap_adopted_zombies(fp_proc->pid);
@@ -1885,11 +2095,109 @@ bool capture_runtime_snapshots(fp_prochandle* fp_proc) {
     if (root_externally_stopped || (fp_proc->flags & FP_LIVE) == 0) {
         return true;
     }
+    if (exiting != 0) return true;
     if (wait_time == -1) {
-        continue_until_quiescent(fp_proc);
+        (void)continue_until_quiescent(fp_proc);
     } else {
-        continue_until_elapsed(fp_proc, 1);
+        (void)continue_until_elapsed(fp_proc, 1);
     }
+    return true;
+}
+
+unsigned long long system_timestamp_ns() {
+    return static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+std::map<pid_t, unsigned long> process_identities_for_tree(const std::set<pid_t>& tree) {
+    std::map<pid_t, unsigned long> result;
+    for (pid_t pid : tree) {
+        unsigned long start_time = 0;
+        if (!read_process_start_time(pid, &start_time)) {
+            abend("process %d disappeared while recording working-set identity\n", pid);
+        }
+        result.emplace(pid, start_time);
+    }
+    return result;
+}
+
+std::map<pid_t, linux_procfs::SmapsDetail> read_tree_smaps_detail(
+    const std::set<pid_t>& tree) {
+    std::map<pid_t, linux_procfs::SmapsDetail> result;
+    linux_procfs::SmapsReadBudget budget;
+    for (pid_t pid : tree) {
+        if (exiting != 0) throw CaptureInterrupted {};
+        linux_procfs::SmapsDetail detail;
+        std::string reason;
+        if (!linux_procfs::read_smaps_detail(pid, &detail, &reason, &budget,
+                                             []() { return exiting != 0; })) {
+            if (exiting != 0) throw CaptureInterrupted {};
+            abend("%s\n", reason.c_str());
+        }
+        result.emplace(pid, std::move(detail));
+    }
+    return result;
+}
+
+// Establish the start boundary while frozen, then let the exact application
+// tree run for the requested interval. A second freeze and topology validation
+// happen in collect_memftprt before any successful report is committed.
+bool prepare_working_set(fp_prochandle* fp_proc,
+                         std::optional<working_set_capture_state>* state_out) {
+    state_out->reset();
+    if (working_set_seconds == 0) return true;
+    if (root_externally_stopped) {
+        abend("--working-set cannot run an externally stopped target\n");
+    }
+
+    user_message("freezing process tree to begin a %u-second working-set window\n",
+                 working_set_seconds);
+    const std::set<pid_t> tree = freeze_process_tree(fp_proc->pid);
+    working_set_capture_state state;
+    state.freeze_backend = selected_freeze_backend;
+    state.cgroup_path = selected_cgroup_path;
+    state.process_identities = process_identities_for_tree(tree);
+    {
+        const std::map<pid_t, linux_procfs::SmapsDetail> baseline =
+            read_tree_smaps_detail(tree);
+        for (const auto& process : baseline) {
+            state.mapping_identities[process.first] =
+                linux_working_set::mapping_identities(process.second);
+        }
+    }
+    for (pid_t pid : tree) {
+        std::string reason;
+        if (!linux_working_set::clear_referenced_bits(pid, &reason)) {
+            abend("working-set setup failed for process %d: %s\n", pid, reason.c_str());
+        }
+    }
+
+    // Auto mode is resolved once. Using the same backend at the end prevents
+    // a method change from being mistaken for one consistent experiment.
+    requested_freeze_mode = selected_freeze_backend == "cgroup" ? FreezeMode::cgroup
+                                                                  : FreezeMode::signals;
+    state.info.requested_window_seconds = working_set_seconds;
+    state.info.started_timestamp_ns = system_timestamp_ns();
+    state.started_monotonic = std::chrono::steady_clock::now();
+    if (!thaw_cgroup()) {
+        abend("could not thaw target after clearing referenced bits\n");
+    }
+    if (!resume_stopped_descendants()) {
+        abend("could not resume descendants for the working-set window\n");
+    }
+
+    fp_proc->cursig = 0;
+    continue_running(fp_proc);
+    root_stopped_by_us = false;
+    const WaitOutcome window_outcome = continue_until_elapsed(fp_proc, working_set_seconds);
+    if (window_outcome == WaitOutcome::interrupted) return false;
+    if (window_outcome == WaitOutcome::external_stop) {
+        abend("--working-set window ended early because the target entered an external "
+              "job-control stop\n");
+    }
+    *state_out = std::move(state);
     return true;
 }
 
@@ -1900,11 +2208,42 @@ void write_capture_metadata(pid_t root_pid) {
     std::ostringstream output;
     output << "key\tpid\tvalue\n";
     output << "freeze_backend\t" << root_pid << '\t' << selected_freeze_backend << '\n';
+    output << "mapping_detail\t" << root_pid << '\t'
+           << (mappings_enabled ? "captured" : "not_requested") << '\n';
+    output << "reference_scope\t" << root_pid << '\t'
+           << (captured_working_set.has_value() ? "since_clear_refs" : "kernel_current")
+           << '\n';
+    output << "pidfd\t" << root_pid << '\t' << pidfd_capture_status() << '\n';
+    for (const auto& source : captured_smaps_sources) {
+        output << "smaps_source\t" << source.first << '\t' << source.second << '\n';
+    }
+    for (const auto& snapshot : snapshot_capture_status) {
+        output << "snapshot_" << snapshot.first << '\t' << root_pid << '\t'
+               << snapshot.second << '\n';
+    }
+    if (captured_working_set.has_value()) {
+        output << "working_set\t" << root_pid << "\tcaptured\n";
+        output << "clear_refs\t" << root_pid << "\tused\n";
+        output << "working_set_requested_seconds\t" << root_pid << '\t'
+               << captured_working_set->requested_window_seconds << '\n';
+        output << "working_set_actual_ns\t" << root_pid << '\t'
+               << captured_working_set->actual_window_ns << '\n';
+        output << "working_set_validation_scope\t" << root_pid << '\t'
+               << captured_working_set->validation_scope << '\n';
+        output << "working_set_process_identity_matches_at_boundaries\t" << root_pid
+               << "\ttrue\n";
+        output << "working_set_mapping_topology_matches_at_boundaries\t" << root_pid
+               << "\ttrue\n";
+    } else {
+        output << "working_set\t" << root_pid << "\tnot_requested\n";
+        output << "clear_refs\t" << root_pid << "\tnot_requested\n";
+    }
     if (original_launcher_pid > 0 && original_launcher_pid != root_pid) {
         output << "launcher_pid\t" << root_pid << '\t' << original_launcher_pid << '\n';
     }
     if (!selected_cgroup_path.empty()) {
-        output << "cgroup_path\t" << root_pid << '\t' << sanitize_tsv(selected_cgroup_path)
+        output << "cgroup_path\t" << root_pid << '\t'
+               << sanitize_tsv_field(selected_cgroup_path)
                << '\n';
     }
     for (const auto& capture : jvm_capture_status) {
@@ -1913,14 +2252,15 @@ void write_capture_metadata(pid_t root_pid) {
         output << "jvm_runtime\t" << capture.first << '\t' << metadata.runtime << '\n';
         if (!metadata.runtime_version.empty()) {
             output << "jvm_runtime_version\t" << capture.first << '\t'
-                   << sanitize_tsv(metadata.runtime_version) << '\n';
+                   << sanitize_tsv_field(metadata.runtime_version) << '\n';
         }
         if (metadata.timestamp_ns != 0) {
             output << "jvm_timestamp_ns\t" << capture.first << '\t' << metadata.timestamp_ns
                    << '\n';
         }
         output << "jvm_duration_ns\t" << capture.first << '\t' << metadata.duration_ns << '\n';
-        output << "jvm_method\t" << capture.first << '\t' << sanitize_tsv(metadata.method) << '\n';
+        output << "jvm_method\t" << capture.first << '\t'
+               << sanitize_tsv_field(metadata.method) << '\n';
         output << "jvm_units\t" << capture.first << '\t' << metadata.units << '\n';
         output << "jvm_forced_gc\t" << capture.first << '\t'
                << (metadata.forced_gc ? "true" : "false") << '\n';
@@ -1930,8 +2270,32 @@ void write_capture_metadata(pid_t root_pid) {
     }
 }
 
-void collect_memftprt(fp_prochandle* fp_proc) {
+void write_capture_complete(pid_t root_pid) {
+    std::ostringstream output;
+    output << "key\tpid\tvalue\n";
+    output << "status\t" << root_pid << "\tcomplete\n";
+    output << "artifact_count\t" << root_pid << '\t'
+           << artifact_store->committed_count() << '\n';
+    for (const std::string& artifact : artifact_store->committed_artifacts()) {
+        output << "artifact\t" << root_pid << '\t'
+               << sanitize_tsv_field(std::filesystem::path(artifact).filename().string()) << '\n';
+    }
+
+    const std::string output_name =
+        output_path("capture_complete_" + std::to_string(root_pid) + ".tsv");
+    std::string reason;
+    if (!write_atomic_text(output_name, output.str(), &reason)) {
+        abend("%s\n", reason.c_str());
+    }
+}
+
+MemoryReport collect_memftprt(fp_prochandle* fp_proc,
+                              working_set_capture_state* working_set_state = nullptr) {
     const std::set<pid_t> process_tree = freeze_process_tree(fp_proc->pid);
+    // This is the end of the Referenced observation interval: after the freeze
+    // returns, no member of the validated tree can acquire another accessed bit.
+    const auto final_freeze_monotonic = std::chrono::steady_clock::now();
+    const unsigned long long final_freeze_timestamp_ns = system_timestamp_ns();
     if (selected_freeze_backend == "cgroup") {
         std::set<pid_t> cgroup_processes;
         std::string reason;
@@ -1943,7 +2307,41 @@ void collect_memftprt(fp_prochandle* fp_proc) {
                   reason.empty() ? "" : ": ", reason.c_str());
         }
     }
-    collect_process_tree_memory(fp_proc->pid, process_tree);
+    std::map<pid_t, linux_procfs::SmapsDetail> final_details;
+    if (working_set_state != nullptr) {
+        if (selected_freeze_backend != working_set_state->freeze_backend ||
+            selected_cgroup_path != working_set_state->cgroup_path) {
+            abend("working-set freeze backend or cgroup changed during the observation window\n");
+        }
+        const std::map<pid_t, unsigned long> final_process_identities =
+            process_identities_for_tree(process_tree);
+        if (final_process_identities != working_set_state->process_identities) {
+            abend("working-set process identities did not match between boundary snapshots\n");
+        }
+        final_details = read_tree_smaps_detail(process_tree);
+        for (const auto& process : final_details) {
+            const auto baseline = working_set_state->mapping_identities.find(process.first);
+            if (baseline == working_set_state->mapping_identities.end() ||
+                baseline->second != linux_working_set::mapping_identities(process.second)) {
+                abend("working-set mapping topology for process %d did not match between "
+                      "boundary snapshots\n",
+                      process.first);
+            }
+        }
+        working_set_state->info.actual_window_ns = static_cast<unsigned long long>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                final_freeze_monotonic - working_set_state->started_monotonic)
+                .count());
+        working_set_state->info.ended_timestamp_ns = final_freeze_timestamp_ns;
+        working_set_state->info.process_identity_matches_at_boundaries = true;
+        working_set_state->info.mapping_topology_matches_at_boundaries = true;
+        captured_working_set = working_set_state->info;
+    } else {
+        captured_working_set.reset();
+    }
+    MemoryReport memory_report = build_process_tree_memory_report(
+        fp_proc->pid, process_tree, final_freeze_timestamp_ns,
+        final_details.empty() ? nullptr : &final_details);
 
     proc_stats stats {};
     char dirname[80];
@@ -2034,11 +2432,20 @@ void collect_memftprt(fp_prochandle* fp_proc) {
     const std::string maps_name = output_path("proccess_maps_" + pid + ".txt");
     const std::string ps_name = output_path("process_ps_" + pid + ".txt");
     const std::string top_name = output_path("process_top_" + pid + ".txt");
-    run_snapshot_command("/bin/cat", {"/proc/" + pid + "/maps"}, maps_name);
-    run_snapshot_command("/bin/ps",
-                         {"-o", "pid,uid,state,rss,vsz,minflt,majflt,args", "-p", pid}, ps_name);
-    run_snapshot_command("/usr/bin/top", {"-b", "-n", "1", "-p", pid}, top_name);
-    write_capture_metadata(fp_proc->pid);
+    snapshot_capture_status["process_maps"] =
+        run_snapshot_command("cat", {"/proc/" + pid + "/maps"}, maps_name)
+            ? "captured"
+            : "unavailable";
+    snapshot_capture_status["process_ps"] =
+        run_snapshot_command("ps",
+                             {"-o", "pid,uid,state,rss,vsz,minflt,majflt,args", "-p", pid},
+                             ps_name)
+            ? "captured"
+            : "unavailable";
+    snapshot_capture_status["process_top"] =
+        run_snapshot_command("top", {"-b", "-n", "1", "-p", pid}, top_name)
+            ? "captured"
+            : "unavailable";
     if (selected_freeze_backend == "cgroup") {
         std::set<pid_t> cgroup_processes;
         std::string reason;
@@ -2056,6 +2463,7 @@ void collect_memftprt(fp_prochandle* fp_proc) {
     if (!resume_stopped_descendants()) {
         abend("capture completed but one or more descendants could not be resumed\n");
     }
+    return memory_report;
 }
 
 fp_prochandle* grab_process(pid_t pid) {
@@ -2141,18 +2549,53 @@ void analyze_pid(pid_t pid) {
     target_process = grab_process(pid);
     acquire_output_lock(pid);
     announce_wait(pid, "attached to");
-    if (wait_time == -1) {
-        continue_until_quiescent(target_process);
-    } else {
-        continue_until_elapsed(target_process, static_cast<unsigned>(wait_time));
+    const WaitOutcome wait_outcome =
+        wait_time == -1
+            ? continue_until_quiescent(target_process)
+            : continue_until_elapsed(target_process, static_cast<unsigned>(wait_time));
+    if (wait_outcome == WaitOutcome::interrupted) {
+        cleanup_capture_target();
+        return;
     }
+    if (abandon_interrupted_capture()) return;
     (void)capture_runtime_snapshots(target_process);
+    if (abandon_interrupted_capture()) return;
+    std::optional<working_set_capture_state> working_set_state;
+    if (!prepare_working_set(target_process, &working_set_state)) {
+        cleanup_capture_target();
+        return;
+    }
     user_message("freezing process tree and reading memory accounting\n");
-    collect_memftprt(target_process);
+    MemoryReport memory_report = collect_memftprt(
+        target_process, working_set_state.has_value() ? &*working_set_state : nullptr);
     if (!quiet_mode) report();
-    announce_completion(target_process->pid);
+    const pid_t captured_pid = target_process->pid;
     release_process(target_process);
     target_process = nullptr;
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_memory_reports(memory_report);
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_capture_metadata(captured_pid);
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_capture_complete(captured_pid);
+    if (exiting != 0) {
+        std::string reason;
+        const std::string marker =
+            output_path("capture_complete_" + std::to_string(captured_pid) + ".tsv");
+        if (!artifact_store->remove_file(marker, true, &reason)) abend("%s\n", reason.c_str());
+        release_output_lock();
+        return;
+    }
+    announce_completion(captured_pid);
     release_output_lock();
 }
 
@@ -2161,22 +2604,57 @@ void analyze(char** argv) {
     target_process = start_process(argv);
     acquire_output_lock(target_process->pid);
     announce_wait(target_process->pid, "launched");
-    if (wait_time == -1) {
-        continue_until_quiescent(target_process);
-    } else {
-        continue_until_elapsed(target_process, static_cast<unsigned>(wait_time));
+    const WaitOutcome wait_outcome =
+        wait_time == -1
+            ? continue_until_quiescent(target_process)
+            : continue_until_elapsed(target_process, static_cast<unsigned>(wait_time));
+    if (wait_outcome == WaitOutcome::interrupted) {
+        cleanup_capture_target();
+        return;
     }
+    if (abandon_interrupted_capture()) return;
     (void)capture_runtime_snapshots(target_process);
+    if (abandon_interrupted_capture()) return;
+    std::optional<working_set_capture_state> working_set_state;
+    if (!prepare_working_set(target_process, &working_set_state)) {
+        cleanup_capture_target();
+        return;
+    }
     user_message("freezing process tree and reading memory accounting\n");
-    collect_memftprt(target_process);
+    MemoryReport memory_report = collect_memftprt(
+        target_process, working_set_state.has_value() ? &*working_set_state : nullptr);
     if (!quiet_mode) report();
-    announce_completion(target_process->pid);
+    const pid_t captured_pid = target_process->pid;
     if (kill_before_exit) {
         kill_process(target_process);
     } else {
         release_process(target_process);
     }
     target_process = nullptr;
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_memory_reports(memory_report);
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_capture_metadata(captured_pid);
+    if (exiting != 0) {
+        release_output_lock();
+        return;
+    }
+    write_capture_complete(captured_pid);
+    if (exiting != 0) {
+        std::string reason;
+        const std::string marker =
+            output_path("capture_complete_" + std::to_string(captured_pid) + ".tsv");
+        if (!artifact_store->remove_file(marker, true, &reason)) abend("%s\n", reason.c_str());
+        release_output_lock();
+        return;
+    }
+    announce_completion(captured_pid);
     release_output_lock();
 }
 
@@ -2194,15 +2672,55 @@ int run_capture(const CommandLine& command_line, char** argv) {
     requested_report_format = config.report_format;
     jcmd_enabled = config.jcmd_enabled;
     enable_jvm_nmt = config.enable_jvm_nmt;
+    mappings_enabled = config.mappings_enabled;
+    working_set_seconds = config.working_set_seconds;
     requested_launch_cgroup = config.launch_cgroup;
+    snapshot_capture_status.clear();
     artifact_store = std::make_unique<ArtifactStore>(config.output_directory);
     std::string output_reason;
     if (!artifact_store->prepare(&output_reason)) throw cli::Error(output_reason);
 
-    if (command_line.target_pid != -1) {
-        analyze_pid(static_cast<pid_t>(command_line.target_pid));
-    } else {
-        analyze(argv + command_line.command_index);
+    try {
+        if (command_line.target_pid != -1) {
+            analyze_pid(static_cast<pid_t>(command_line.target_pid));
+        } else {
+            analyze(argv + command_line.command_index);
+        }
+    } catch (const CaptureInterrupted&) {
+        cleanup_capture_target();
+        return exiting == 0 ? 254 : 128 + static_cast<int>(exiting);
+    } catch (const std::exception& error) {
+        // In particular, std::bad_alloc can occur while assembling a detailed
+        // mapping report. Never let a C++ exception bypass target cleanup.
+        std::fprintf(stderr, "%s: aborting - unexpected failure: %s\n", program_name,
+                     error.what());
+        (void)thaw_cgroup();
+        (void)resume_stopped_descendants();
+        if (target_process != nullptr) {
+            if (kill_before_exit) {
+                kill_process(target_process);
+            } else {
+                release_process(target_process);
+            }
+            target_process = nullptr;
+        }
+        release_output_lock();
+        return 254;
+    } catch (...) {
+        std::fprintf(stderr, "%s: aborting - unexpected non-standard failure\n",
+                     program_name);
+        (void)thaw_cgroup();
+        (void)resume_stopped_descendants();
+        if (target_process != nullptr) {
+            if (kill_before_exit) {
+                kill_process(target_process);
+            } else {
+                release_process(target_process);
+            }
+            target_process = nullptr;
+        }
+        release_output_lock();
+        return 254;
     }
     return exiting == 0 ? 0 : 128 + static_cast<int>(exiting);
 }

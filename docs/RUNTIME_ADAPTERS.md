@@ -1,3 +1,10 @@
+---
+layout: default
+title: Runtime-aware capture
+description: How OS ownership and JVM, Node.js, or Go runtime measurements fit together.
+permalink: /runtime-adapters/
+---
+
 # Runtime-aware memory capture
 
 `memftprt` should treat Linux memory accounting as the authoritative ownership

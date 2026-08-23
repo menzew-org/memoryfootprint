@@ -21,6 +21,9 @@ memftprt --format all --output-dir captures -- ./server --port 8080
 
 Open `memory_report_PID.html` for an annotated human view, consume
 `memory_report_PID.json` in automation, or use the TSV with shell tools.
+The familiar `maps`, `ps`, and `top` text snapshots are optional diagnostics;
+the memory report still completes when those utilities are unavailable, and
+`capture_metadata_PID.tsv` records their status.
 
 ## Capture a continuously busy worker
 
@@ -69,7 +72,8 @@ The supplied cgroup must already exist, be empty, be thawed, and have writable
 
 ```sh
 if memftprt --quiet --output-dir captures --pid "$pid"; then
-  ./examples/read-total.sh captures/process_tree_memory_*.tsv
+  test -s "captures/capture_complete_${pid}.tsv"
+  ./examples/read-total.sh "captures/process_tree_memory_${pid}.tsv"
 fi
 ```
 
@@ -94,6 +98,32 @@ MEMFTPRT_TIMEOUT=120 \
 ```sh
 ./examples/read-total.sh captures/process_tree_memory_*.tsv
 ```
+
+## Find the mappings responsible for memory
+
+~~~sh
+./build/memftprt --mappings --format all --output-dir captures -- \
+  ./server --port 8080
+column -s $'\t' -t captures/memory_mapping_categories_*.tsv
+~~~
+
+Open the HTML report for category totals and a collapsible mapping table. Use
+the memory_mappings_PID.tsv artifact when you need to sort or filter every VMA.
+
+## Measure a ten-second referenced working set
+
+~~~sh
+./build/memftprt --working-set 10 --format all --output-dir captures -- \
+  ./server --port 8080
+~~~
+
+The resulting referenced_kb values mean “marked referenced since memftprt
+cleared reference state,” not total RSS and not an exact trace of every load.
+Process and mapping identities must match at the two frozen boundaries;
+persistent churn aborts the measurement. Churn that appears and disappears
+entirely inside the interval cannot be seen by endpoint snapshots. This mode
+also resets kernel reference state and should be treated as a deliberate
+measurement perturbation.
 
 For the meaning of the values and why they differ, read
 [Understanding the output](../docs/UNDERSTANDING_OUTPUT.md).
