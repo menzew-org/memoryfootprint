@@ -71,7 +71,7 @@ For each OpenJDK release:
 </div>
 
 <figure class="study-figure">
-  <img src="{{ '/assets/studies/openjdk-8-25/pss-controlled.svg' | relative_url }}"
+  <img src="https://menzew.github.io/memoryfootprint/assets/studies/openjdk-8-25/pss-controlled.svg"
        alt="Line chart of median PSS for HelloIdle and RuntimeExercise on OpenJDK 8 through 25. HelloIdle stays between 20 and 37 MiB. RuntimeExercise ranges from 205 to 303 MiB and becomes more variable from OpenJDK 12 onward.">
   <figcaption>Median process-tree PSS from five captures. MAD bars show run-to-run
   spread; they are not confidence intervals. <span class="mobile-chart-note">Scroll
@@ -155,10 +155,10 @@ Tracking (NMT). It helps explain PSS, but it is **not added to PSS**.
 
 <nav class="data-downloads" aria-label="Download study data">
   <strong>Use the data</strong>
-  <a href="{{ '/assets/studies/openjdk-8-25/publication.csv' | relative_url }}">Download CSV</a>
-  <a href="{{ '/assets/studies/openjdk-8-25/publication.json' | relative_url }}">Download JSON</a>
-  <a href="{{ '/assets/studies/openjdk-8-25/analysis.json' | relative_url }}">View derived analysis</a>
-  <a href="{{ '/assets/studies/openjdk-8-25/provenance.json' | relative_url }}">Audit capture provenance</a>
+  <a href="https://menzew.github.io/memoryfootprint/assets/studies/openjdk-8-25/publication.csv">Download CSV</a>
+  <a href="https://menzew.github.io/memoryfootprint/assets/studies/openjdk-8-25/publication.json">Download JSON</a>
+  <a href="https://menzew.github.io/memoryfootprint/assets/studies/openjdk-8-25/analysis.json">View derived analysis</a>
+  <a href="https://menzew.github.io/memoryfootprint/assets/studies/openjdk-8-25/provenance.json">Audit capture provenance</a>
 </nav>
 
 ## Why the active result jumps between runs
