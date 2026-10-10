@@ -1,5 +1,7 @@
 # memftprt
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/menzew-org/memoryfootprint?utm_source=badge)
+
 `memftprt` captures a consistent, process-tree-wide memory footprint on Linux.
 It waits for an application to settle, optionally collects HotSpot JVM Native
 Memory Tracking data, freezes the complete application tree, and writes both a
@@ -278,6 +280,22 @@ environment denies ptrace, the suite exits `77`; use
 `MEMFTPRT_ALLOW_PTRACE_SKIP=1` only when another job provides ptrace coverage.
 The GitHub Actions workflow provisions a delegated cgroup and requires this
 integration test rather than silently skipping it.
+
+## Benchmarks
+
+Google Benchmark microbenchmarks in `benchmarks/` cover smaps parsing, mapping
+classification, report rendering (TSV, JSON, HTML), and HotSpot NMT parsing
+using synthetic inputs. They require CMake 3.16+ and network access to fetch
+the benchmark library:
+
+```sh
+cmake -S benchmarks -B build/benchmarks
+cmake --build build/benchmarks -j
+./build/benchmarks/memftprt_bench
+```
+
+The CodSpeed workflow runs them on every pull request and push to `main` with
+CodSpeed's CPU simulation instrument to track performance changes.
 
 ## Further reading
 
